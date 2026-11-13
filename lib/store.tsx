@@ -4,8 +4,8 @@
  * LocalHints state layer.
  *
  * This is the ONLY file that knows where data lives (browser localStorage in the
- * prototype). To move to Supabase + Stripe, replace the bodies of the actions in
- * `actions` below with API calls; the components only ever call `useStore()`.
+ * prototype). To move to Supabase + Stripe + Apple/Google Wallet pass updates, replace the
+ * bodies of the actions in `actions` below with API calls; components only call `useStore()`.
  */
 
 import {
@@ -18,29 +18,42 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { buildSeed, DEMO_OWNER_ID } from '@/data/seed';
+import { buildSeed, conciergeDealFor, DEMO_ACCOUNT_ID, DEMO_EMAIL, DEMO_PASSWORD } from '@/data/seed';
+import { hashPassword, passwordProblem, validateEmail, verifyPassword } from '@/lib/auth';
+import { haversineMiles } from '@/lib/geo';
+import { dealLabel } from '@/components/ui/format';
 import {
-  BLAST_MAX_CHARS,
-  BLAST_MIN_CHARS,
+  DEFAULT_BRAND_COLOR,
+  DROP_MAX_MILES,
+  DROP_MIN_MILES,
   FREE_DEAL_DURATION_DAYS,
+  PILOT_DAYS,
+  PILOT_SLOTS,
   POINTS,
+  PUSH_MAX_CHARS,
+  PUSH_MIN_CHARS,
+  SIM_SHOPPERS_PER_SQ_MILE,
   TIER_LIMITS,
+  WEEK_MS,
   type AppState,
-  type Blast,
   type Business,
+  type BusinessAccount,
   type Consumer,
   type CreateDealInput,
   type Deal,
-  type DealStatus,
+  type Drop,
   type ModerationStatus,
   type Pass,
+  type PassPush,
   type RegisterBusinessInput,
-  type Role,
+  type SignUpInput,
   type SpotDealInput,
   type Tier,
+  type TierLimits,
+  type WalletNotification,
 } from '@/types/localhints';
 
-const STORAGE_KEY = 'localhints:v1';
+const STORAGE_KEY = 'localhints:v3';
 const DAY = 86_400_000;
 
 export type Result<T = undefined> = { ok: true; data: T } | { ok: false; error: string };
@@ -64,9 +77,53 @@ function shortCode(): string {
   return out;
 }
 
+function uniquePassCode(dealCode: string, passes: Pass[]): string {
+  for (let i = 0; i < 20; i++) {
+    const code = `${dealCode}-${shortCode()}`;
+    if (!passes.some((p) => p.code === code)) return code;
+  }
+  return `${dealCode}-${shortCode()}${shortCode()}`;
+}
+
+function uniqueReferral(name: string, passes: Pass[]): string {
+  const slug = name.toLowerCase().replace(/[^a-z]/g, '').slice(0, 10) || 'friend';
+  for (let i = 0; i < 50; i++) {
+    const code = `${slug}-${10 + Math.floor(Math.random() * 90)}`;
+    if (!passes.some((p) => p.referralCode === code)) return code;
+  }
+  return `${slug}-${Date.now().toString(36)}`;
+}
+
+function addNote(
+  list: WalletNotification[],
+  kind: WalletNotification['kind'],
+  message: string,
+  dealId?: string,
+): WalletNotification[] {
+  const note: WalletNotification = { id: uid('note'), kind, message, dealId, createdAt: new Date().toISOString() };
+  return [note, ...list].slice(0, 20);
+}
+
 // ---------------------------------------------------------------------------
 // Pure selectors (exported so components and a future server can share them)
 // ---------------------------------------------------------------------------
+
+export function isPilotActive(biz: Business, now: number): boolean {
+  return biz.pilotEndsAt !== null && new Date(biz.pilotEndsAt).getTime() > now;
+}
+
+/** Pilot businesses get Pro features for free until the pilot ends. */
+export function effectiveTier(biz: Business, now: number): Tier {
+  return isPilotActive(biz, now) ? 'pro' : biz.tier;
+}
+
+export function limitsFor(biz: Business, now: number): TierLimits {
+  return TIER_LIMITS[effectiveTier(biz, now)];
+}
+
+export function pilotSlotsUsed(state: AppState, now: number): number {
+  return state.businesses.filter((b) => isPilotActive(b, now)).length;
+}
 
 export function claimsFor(state: AppState, dealId: string): Pass[] {
   return state.passes.filter((p) => p.dealId === dealId);
@@ -76,35 +133,132 @@ export function isDealExpired(deal: Deal, now: number): boolean {
   return new Date(deal.expiresAt).getTime() <= now;
 }
 
-/** A deal is "live" for consumers when it is unpaused, unexpired, under its claim cap and its business is approved. */
+/** Recurring ("slow-hours") deals are only open inside their weekly window. */
+export function isDealOpenNow(deal: Deal, now: number): boolean {
+  if (deal.expirationMode !== 'recurring' || !deal.recurring) return true;
+  const d = new Date(now);
+  return (
+    deal.recurring.days.includes(d.getDay()) &&
+    d.getHours() >= deal.recurring.startHour &&
+    d.getHours() < deal.recurring.endHour
+  );
+}
+
+/** Live for consumers: unpaused, unexpired, in its window, under its cap, business approved. */
 export function isDealLive(deal: Deal, state: AppState, now: number): boolean {
   if (deal.status !== 'live') return false;
   if (isDealExpired(deal, now)) return false;
+  if (!isDealOpenNow(deal, now)) return false;
   const biz = state.businesses.find((b) => b.id === deal.businessId);
   if (!biz || biz.status !== 'approved') return false;
   if (deal.claimLimit !== null && claimsFor(state, deal.id).length >= deal.claimLimit) return false;
   return true;
 }
 
-/** Deals that count against a business's tier cap: unpaused and unexpired. */
-export function countActiveDeals(state: AppState, businessId: string, now: number): number {
+/** True for deals that exist in the feed even if currently outside a recurring window. */
+export function isDealRunning(deal: Deal, state: AppState, now: number): boolean {
+  if (deal.status !== 'live' || isDealExpired(deal, now)) return false;
+  const biz = state.businesses.find((b) => b.id === deal.businessId);
+  return !!biz && biz.status === 'approved';
+}
+
+function sameMonth(iso: string, now: number): boolean {
+  const a = new Date(iso);
+  const b = new Date(now);
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
+}
+
+/** Published (non-draft) deals created this calendar month. Counts toward the Free quota. */
+export function dealsThisMonth(state: AppState, businessId: string, now: number): number {
   return state.deals.filter(
-    (d) => d.businessId === businessId && d.status === 'live' && !isDealExpired(d, now),
+    (d) => d.businessId === businessId && d.status !== 'draft' && sameMonth(d.createdAt, now),
   ).length;
 }
 
-export function blastsThisMonth(state: AppState, businessId: string, now: number): number {
-  const ref = new Date(now);
-  return state.blasts.filter((b) => {
-    if (b.businessId !== businessId) return false;
-    const sent = new Date(b.sentAt);
-    return sent.getFullYear() === ref.getFullYear() && sent.getMonth() === ref.getMonth();
-  }).length;
+/** Wallet saves (new passes) across all of a business's deals this calendar month. */
+export function savesThisMonth(state: AppState, businessId: string, now: number): number {
+  const ids = new Set(state.deals.filter((d) => d.businessId === businessId).map((d) => d.id));
+  return state.passes.filter((p) => ids.has(p.dealId) && sameMonth(p.claimedAt, now)).length;
 }
 
-/** Simulated audience size. A real implementation would be a PostGIS ST_DWithin count. */
-export function estimateReach(radiusMiles: number): number {
-  return Math.round(60 + radiusMiles * 70);
+export function dropsThisMonth(state: AppState, businessId: string, now: number): number {
+  return state.drops.filter((d) => d.businessId === businessId && sameMonth(d.sentAt, now)).length;
+}
+
+/** Simulated opted-in shoppers inside a radius. Production: a PostGIS ST_DWithin count of opted-in users. */
+export function estimateDropReach(radiusMiles: number): number {
+  return Math.round(Math.PI * radiusMiles * radiusMiles * SIM_SHOPPERS_PER_SQ_MILE);
+}
+
+export function dealQuotaReached(state: AppState, biz: Business, now: number): boolean {
+  const cap = limitsFor(biz, now).dealsPerMonth;
+  return cap !== null && dealsThisMonth(state, biz.id, now) >= cap;
+}
+
+export function saveCapReached(state: AppState, biz: Business, now: number): boolean {
+  const cap = limitsFor(biz, now).savesPerMonth;
+  return cap !== null && savesThisMonth(state, biz.id, now) >= cap;
+}
+
+/** When this specific pass stops working (rolling passes expire a set time after saving). */
+export function passExpiresAt(deal: Deal, pass: Pass): number {
+  const end = new Date(deal.expiresAt).getTime();
+  if (deal.expirationMode === 'rolling' && deal.rollingHours) {
+    return Math.min(end, new Date(pass.claimedAt).getTime() + deal.rollingHours * 3_600_000);
+  }
+  return end;
+}
+
+export type PassStatus = 'active' | 'complete' | 'expired' | 'voided' | 'paused' | 'scheduled';
+
+export function passStatus(deal: Deal, pass: Pass, now: number): PassStatus {
+  if (pass.redeemedAt) return 'complete';
+  if (deal.status === 'ended') return 'voided';
+  if (passExpiresAt(deal, pass) <= now) return 'expired';
+  if (deal.status === 'paused') return 'paused';
+  if (!isDealOpenNow(deal, now)) return 'scheduled';
+  return 'active';
+}
+
+/** Share-to-upgrade: the pass shows the upgraded offer once enough friends have saved. */
+export function isPassUpgraded(deal: Deal, pass: Pass): boolean {
+  return !!deal.shareUpgrade && pass.friendSaves >= deal.shareUpgrade.friendsNeeded;
+}
+
+/** Passes that would receive a Pass Push for this business (still usable now or later). */
+export function passHolders(state: AppState, businessId: string, now: number): Pass[] {
+  const deals = new Map(state.deals.filter((d) => d.businessId === businessId).map((d) => [d.id, d]));
+  return state.passes.filter((p) => {
+    const deal = deals.get(p.dealId);
+    if (!deal) return false;
+    const status = passStatus(deal, p, now);
+    return status === 'active' || status === 'scheduled' || status === 'paused';
+  });
+}
+
+function redemptionBlocker(deal: Deal, pass: Pass, t: number): string | null {
+  const status = passStatus(deal, pass, t);
+  if (status === 'complete') return 'That pass is already fully redeemed.';
+  if (status === 'voided') return 'The merchant ended this offer.';
+  if (status === 'expired') return 'That pass has expired.';
+  if (status === 'paused') return 'This offer is paused by the merchant.';
+  if (status === 'scheduled') return 'This offer is not active right now.';
+  if (
+    deal.perCustomerLimit === 'weekly' &&
+    pass.lastRedeemedAt &&
+    t - new Date(pass.lastRedeemedAt).getTime() < WEEK_MS
+  ) {
+    return 'Limit reached: one redemption per week.';
+  }
+  return null;
+}
+
+function redemptionOutcome(deal: Deal, pass: Pass): { stamps: number; complete: boolean } {
+  const stamps = pass.stamps + 1;
+  const complete =
+    (deal.punchVisits > 1 && stamps >= deal.punchVisits) ||
+    (deal.punchVisits === 1 && deal.perCustomerLimit === 'once');
+  return { stamps, complete };
 }
 
 // ---------------------------------------------------------------------------
@@ -120,32 +274,55 @@ interface ToastMsg {
 
 export interface StoreActions {
   notify: (message: string, tone?: ToastTone) => void;
-  setRole: (role: Role) => void;
+  signUp: (input: SignUpInput) => Promise<Result<Business>>;
+  signIn: (email: string, password: string) => Promise<Result>;
+  signOut: () => void;
   setActiveBusiness: (id: string) => void;
   updateConsumer: (patch: Partial<Consumer>) => void;
   toggleSave: (dealId: string) => void;
   trackView: (dealId: string) => void;
   claimDeal: (dealId: string) => Result<Pass>;
+  /** Simulates a friend opening someone's share link and saving their own pass. */
+  saveViaReferral: (referralCode: string) => Result<{ upgraded: boolean }>;
   redeemPass: (passId: string) => Result;
-  redeemByCode: (businessId: string, code: string) => Result<{ dealTitle: string }>;
+  redeemByCode: (
+    businessId: string,
+    code: string,
+  ) => Result<{ dealTitle: string; stamps: number; total: number; complete: boolean }>;
+  clearNotifications: () => void;
   spotDeal: (input: SpotDealInput) => Result;
   upvoteSpotted: (id: string) => void;
   registerBusiness: (input: RegisterBusinessInput) => Result<Business>;
-  upgradeTier: (businessId: string, tier: Tier) => void;
+  upgradeTier: (businessId: string, tier: Tier, billing?: 'monthly' | 'annual') => void;
+  enrollPilot: (businessId: string) => Result;
+  endPilot: (businessId: string) => void;
   createDeal: (input: CreateDealInput) => Result<Deal>;
-  setDealStatus: (dealId: string, status: DealStatus) => void;
-  sendBlast: (businessId: string, message: string, radiusMiles: number) => Result<Blast>;
+  publishDraft: (dealId: string) => Result<Deal>;
+  discardDraft: (dealId: string) => void;
+  setDealStatus: (dealId: string, status: 'live' | 'paused') => void;
+  /** Voids the deal on every phone: passes show "Offer ended by merchant". */
+  endDeal: (dealId: string) => void;
+  sendPassPush: (businessId: string, message: string) => Result<PassPush>;
+  /** Neighborhood Drop: alert opted-in shoppers within a radius about one of the business's live deals. */
+  sendDrop: (
+    businessId: string,
+    dealId: string,
+    message: string,
+    radiusMiles: number,
+  ) => Result<{ drop: Drop; deliveredToDemoShopper: boolean }>;
   approveBusiness: (id: string) => void;
   suspendBusiness: (id: string) => void;
   reinstateBusiness: (id: string) => void;
   moderateSpotted: (id: string, approve: boolean) => void;
-  resetDemo: () => void;
+  resetDemo: () => Promise<void>;
 }
 
 export interface StoreApi extends StoreActions {
   state: AppState;
   /** Wall clock in ms, refreshed every 30 seconds so countdowns stay current. */
   now: number;
+  /** The signed-in business owner, or null. */
+  account: BusinessAccount | null;
   ownedBusinesses: Business[];
   activeBusiness: Business | null;
 }
@@ -164,6 +341,30 @@ const TOAST_STYLES: Record<ToastTone, string> = {
   info: 'bg-slate-900 text-white',
 };
 
+const HEX = /^#[0-9a-fA-F]{6}$/;
+
+/** Fresh demo data plus the demo business login (hashed at runtime). */
+async function buildInitialState(now: number): Promise<AppState> {
+  const seed = buildSeed(now);
+  try {
+    const { salt, hash } = await hashPassword(DEMO_PASSWORD);
+    seed.accounts = [
+      {
+        id: DEMO_ACCOUNT_ID,
+        email: DEMO_EMAIL,
+        ownerName: 'Demo Owner',
+        salt,
+        passwordHash: hash,
+        createdAt: new Date(now - 90 * DAY).toISOString(),
+      },
+    ];
+  } catch {
+    // No Web Crypto (plain-HTTP LAN address): the demo login is unavailable until opened over HTTPS.
+    seed.accounts = [];
+  }
+  return seed;
+}
+
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AppState | null>(null);
   const [now, setNow] = useState<number>(0);
@@ -173,20 +374,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // Hydrate from localStorage (or seed) on the client only, avoiding SSR mismatches.
   useEffect(() => {
-    let loaded: AppState | null = null;
-    try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as AppState;
-        if (parsed && parsed.version === 1) loaded = parsed;
+    let cancelled = false;
+    (async () => {
+      let loaded: AppState | null = null;
+      try {
+        const raw = window.localStorage.getItem(STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as AppState;
+          if (parsed && parsed.version === 3) loaded = parsed;
+        }
+      } catch {
+        loaded = null;
       }
-    } catch {
-      loaded = null;
-    }
-    const initial = loaded ?? buildSeed(Date.now());
-    ref.current = initial;
-    setState(initial);
-    setNow(Date.now());
+      const initial = loaded ?? (await buildInitialState(Date.now()));
+      if (cancelled) return;
+      ref.current = initial;
+      setState(initial);
+      setNow(Date.now());
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Persist on every change.
@@ -217,6 +425,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const next = updater(current);
     ref.current = next;
     setState(next);
+    setNow(Date.now());
   }, []);
 
   const actions = useMemo<StoreActions>(() => {
@@ -231,31 +440,143 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         businesses: s.businesses.map((b) => (b.id === id ? { ...b, ...patch } : b)),
       }));
 
-    const finishRedeem = (passId: string, consumerId: string, at: number) =>
+    const patchDeal = (id: string, patch: Partial<Deal>) =>
       commit((s) => ({
         ...s,
-        passes: s.passes.map((p) =>
-          p.id === passId ? { ...p, redeemedAt: new Date(at).toISOString() } : p,
-        ),
-        consumer:
-          s.consumer.id === consumerId
-            ? { ...s.consumer, points: s.consumer.points + POINTS.redeem }
-            : s.consumer,
+        deals: s.deals.map((d) => (d.id === id ? { ...d, ...patch } : d)),
       }));
+
+    const applyRedeem = (passId: string, t: number) =>
+      commit((s) => {
+        const pass = s.passes.find((p) => p.id === passId);
+        const deal = pass ? s.deals.find((d) => d.id === pass.dealId) : undefined;
+        if (!pass || !deal) return s;
+        const { stamps, complete } = redemptionOutcome(deal, pass);
+        const at = new Date(t).toISOString();
+        return {
+          ...s,
+          passes: s.passes.map((p) =>
+            p.id === passId
+              ? { ...p, stamps, lastRedeemedAt: at, redeemedAt: complete ? at : p.redeemedAt }
+              : p,
+          ),
+          consumer:
+            pass.consumerId === s.consumer.id
+              ? { ...s.consumer, points: s.consumer.points + POINTS.redeem }
+              : s.consumer,
+        };
+      });
+
+    /** Shared checks for creating or publishing a deal. */
+    const publishChecks = (biz: Business | undefined, t: number): string | null => {
+      if (!biz) return 'Business not found.';
+      if (biz.status !== 'approved') {
+        return 'Your business must be approved before you can publish deals.';
+      }
+      const s = get();
+      if (dealQuotaReached(s, biz, t)) {
+        const cap = limitsFor(biz, t).dealsPerMonth;
+        return `The Free Starter plan includes ${cap} deals per month. Upgrade to Pro for unlimited deals.`;
+      }
+      return null;
+    };
+
+    /** Validates input and builds a pending Free business plus its concierge draft deal. */
+    const buildBusiness = (
+      ownerId: string,
+      input: RegisterBusinessInput,
+    ): Result<{ biz: Business; draft: Deal }> => {
+      const name = input.name.trim();
+      if (name.length < 2) return fail('Enter your business name.');
+      if (input.address.trim().length < 4) return fail('Enter a street address.');
+      const t = Date.now();
+      const biz: Business = {
+        id: uid('biz'),
+        ownerId,
+        name,
+        category: input.category,
+        emoji: input.emoji,
+        address: input.address.trim(),
+        lat: input.lat,
+        lng: input.lng,
+        blurb: input.blurb.trim(),
+        tier: 'free',
+        status: 'pending',
+        pilotEndsAt: null,
+        createdAt: new Date(t).toISOString(),
+      };
+      // Concierge first deal: a ready-made draft so the owner only has to approve it.
+      return ok({ biz, draft: conciergeDealFor(biz, t, uid('deal')) });
+    };
 
     return {
       notify,
 
-      setRole: (role) =>
+      signUp: async (input) => {
+        const email = input.email.trim().toLowerCase();
+        const ownerName = input.ownerName.trim();
+        if (ownerName.length < 2) return fail('Enter your name.');
+        if (!validateEmail(email)) return fail('Enter a valid email address.');
+        const problem = passwordProblem(input.password);
+        if (problem) return fail(problem);
+        if (get().accounts.some((a) => a.email === email)) {
+          return fail('An account with that email already exists. Sign in instead.');
+        }
+        const built = buildBusiness('pending-account', input.business);
+        if (!built.ok) return fail(built.error);
+        let creds: { salt: string; hash: string };
+        try {
+          creds = await hashPassword(input.password);
+        } catch (e) {
+          return fail(e instanceof Error ? e.message : 'Could not secure your password.');
+        }
+        const account: BusinessAccount = {
+          id: uid('acct'),
+          email,
+          ownerName,
+          salt: creds.salt,
+          passwordHash: creds.hash,
+          createdAt: new Date().toISOString(),
+        };
+        const { biz, draft } = built.data;
+        const owned: Business = { ...biz, ownerId: account.id };
+        commit((s) => ({
+          ...s,
+          accounts: [...s.accounts, account],
+          sessionAccountId: account.id,
+          businesses: [...s.businesses, owned],
+          deals: [draft, ...s.deals],
+          activeBusinessId: owned.id,
+        }));
+        notify('Account created. We drafted your first deal.');
+        return ok(owned);
+      },
+
+      signIn: async (email, password) => {
+        const needle = email.trim().toLowerCase();
+        const account = get().accounts.find((a) => a.email === needle);
+        let valid = false;
+        try {
+          // Always run the hash so a missing account takes about as long as a wrong password.
+          valid = account
+            ? await verifyPassword(password, account.salt, account.passwordHash)
+            : (await verifyPassword(password, '00'.repeat(16), '0'.repeat(64)), false);
+        } catch (e) {
+          return fail(e instanceof Error ? e.message : 'Could not sign in.');
+        }
+        if (!account || !valid) return fail('Incorrect email or password.');
         commit((s) => {
-          const owned = s.businesses.filter((b) => b.ownerId === DEMO_OWNER_ID);
-          const activeValid = owned.some((b) => b.id === s.activeBusinessId);
-          return {
-            ...s,
-            role,
-            activeBusinessId: activeValid ? s.activeBusinessId : (owned[0]?.id ?? null),
-          };
-        }),
+          const owned = s.businesses.filter((b) => b.ownerId === account.id);
+          return { ...s, sessionAccountId: account.id, activeBusinessId: owned[0]?.id ?? null };
+        });
+        notify(`Welcome back, ${account.ownerName.split(' ')[0]}`, 'info');
+        return ok(undefined);
+      },
+
+      signOut: () => {
+        commit((s) => ({ ...s, sessionAccountId: null, activeBusinessId: null }));
+        notify('Signed out', 'info');
+      },
 
       setActiveBusiness: (id) => commit((s) => ({ ...s, activeBusinessId: id })),
 
@@ -285,8 +606,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const s = get();
         const t = Date.now();
         const deal = s.deals.find((d) => d.id === dealId);
-        if (!deal) return fail('That deal no longer exists.');
-        if (!isDealLive(deal, s, t)) return fail('This deal is no longer available.');
+        const biz = deal ? s.businesses.find((b) => b.id === deal.businessId) : undefined;
+        if (!deal || !biz) return fail('That deal no longer exists.');
+        if (!isDealLive(deal, s, t)) return fail('This deal is not available right now.');
+        if (saveCapReached(s, biz, t)) {
+          return fail('This offer has reached its save limit for the month. Try again next month.');
+        }
         if (s.passes.some((p) => p.dealId === dealId && p.consumerId === s.consumer.id)) {
           return fail('You already have this pass.');
         }
@@ -294,8 +619,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           id: uid('pass'),
           dealId,
           consumerId: s.consumer.id,
-          code: `${deal.code}-${shortCode()}`,
+          code: uniquePassCode(deal.code, s.passes),
+          referralCode: uniqueReferral(s.consumer.name, s.passes),
+          referredBy: null,
           claimedAt: new Date(t).toISOString(),
+          stamps: 0,
+          friendSaves: 0,
+          lastRedeemedAt: null,
           redeemedAt: null,
         };
         commit((st) => ({
@@ -307,16 +637,80 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return ok(pass);
       },
 
+      saveViaReferral: (referralCode) => {
+        const s = get();
+        const t = Date.now();
+        const source = s.passes.find((p) => p.referralCode === referralCode.trim().toLowerCase());
+        if (!source) return fail('That share link is not valid.');
+        const deal = s.deals.find((d) => d.id === source.dealId);
+        const biz = deal ? s.businesses.find((b) => b.id === deal.businessId) : undefined;
+        if (!deal || !biz) return fail('That offer no longer exists.');
+        if (!isDealLive(deal, s, t)) return fail('This offer is not available to new friends right now.');
+        if (saveCapReached(s, biz, t)) return fail('This offer is at its save limit for the month.');
+
+        const friendId = uid('friend');
+        const friendPass: Pass = {
+          id: uid('pass'),
+          dealId: deal.id,
+          consumerId: friendId,
+          code: uniquePassCode(deal.code, s.passes),
+          referralCode: uniqueReferral('friend', s.passes),
+          referredBy: source.id,
+          claimedAt: new Date(t).toISOString(),
+          stamps: 0,
+          friendSaves: 0,
+          lastRedeemedAt: null,
+          redeemedAt: null,
+        };
+        const after = source.friendSaves + 1;
+        const needed = deal.shareUpgrade ? deal.shareUpgrade.friendsNeeded : null;
+        const upgraded = deal.shareUpgrade !== null && source.friendSaves < (needed ?? 0) && after >= (needed ?? 0);
+
+        let message: string;
+        let kind: WalletNotification['kind'];
+        if (upgraded && deal.shareUpgrade) {
+          kind = 'upgrade';
+          message = `Your friend saved the deal! Your ${biz.name} pass just upgraded to ${dealLabel(
+            deal,
+            deal.shareUpgrade.upgradedValue,
+          )}.`;
+        } else {
+          kind = 'friend';
+          message = `A friend saved your ${biz.name} pass${needed ? ` (${Math.min(after, needed)} of ${needed})` : ''}.`;
+        }
+
+        commit((st) => ({
+          ...st,
+          passes: [
+            friendPass,
+            ...st.passes.map((p) => (p.id === source.id ? { ...p, friendSaves: after } : p)),
+          ],
+          notifications:
+            source.consumerId === st.consumer.id ? addNote(st.notifications, kind, message) : st.notifications,
+        }));
+        notify(upgraded ? 'Pass upgraded! Check your wallet.' : 'Friend saved the deal', 'info');
+        return ok({ upgraded });
+      },
+
       redeemPass: (passId) => {
         const s = get();
         const t = Date.now();
         const pass = s.passes.find((p) => p.id === passId);
         if (!pass) return fail('Pass not found.');
-        if (pass.redeemedAt) return fail('This pass was already redeemed.');
         const deal = s.deals.find((d) => d.id === pass.dealId);
-        if (!deal || isDealExpired(deal, t)) return fail('This pass has expired.');
-        finishRedeem(pass.id, pass.consumerId, t);
-        notify(`Redeemed! Enjoy (+${POINTS.redeem} pts)`);
+        if (!deal) return fail('Offer not found.');
+        if (deal.redemptionMethod !== 'tap') {
+          return fail('Ask the cashier to scan or enter your code.');
+        }
+        const blocked = redemptionBlocker(deal, pass, t);
+        if (blocked) return fail(blocked);
+        applyRedeem(pass.id, t);
+        const { stamps, complete } = redemptionOutcome(deal, pass);
+        notify(
+          deal.punchVisits > 1 && !complete
+            ? `Stamp added: ${stamps} of ${deal.punchVisits} (+${POINTS.redeem} pts)`
+            : `Redeemed! Enjoy (+${POINTS.redeem} pts)`,
+        );
         return ok(undefined);
       },
 
@@ -325,21 +719,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const t = Date.now();
         const needle = code.trim().toUpperCase();
         if (needle.length < 4) return fail('Enter the full pass code.');
-        const bizDealIds = new Set(
-          s.deals.filter((d) => d.businessId === businessId).map((d) => d.id),
+        const bizDeals = new Map(
+          s.deals.filter((d) => d.businessId === businessId).map((d) => [d.id, d]),
         );
-        const pass = s.passes.find(
-          (p) => p.code.toUpperCase() === needle && bizDealIds.has(p.dealId),
-        );
+        const pass = s.passes.find((p) => p.code.toUpperCase() === needle && bizDeals.has(p.dealId));
         if (!pass) return fail('No pass matches that code for this business.');
-        if (pass.redeemedAt) return fail('That pass was already redeemed.');
-        const deal = s.deals.find((d) => d.id === pass.dealId);
-        if (!deal) return fail('Deal not found.');
-        if (isDealExpired(deal, t)) return fail('That pass has expired.');
-        finishRedeem(pass.id, pass.consumerId, t);
-        notify('Pass redeemed');
-        return ok({ dealTitle: deal.title });
+        const deal = bizDeals.get(pass.dealId);
+        if (!deal) return fail('Offer not found.');
+        const blocked = redemptionBlocker(deal, pass, t);
+        if (blocked) return fail(blocked);
+        const outcome = redemptionOutcome(deal, pass);
+        applyRedeem(pass.id, t);
+        notify(
+          deal.punchVisits > 1 && !outcome.complete
+            ? `Stamp ${outcome.stamps} of ${deal.punchVisits} added`
+            : 'Pass redeemed',
+        );
+        return ok({
+          dealTitle: deal.title,
+          stamps: outcome.stamps,
+          total: deal.punchVisits,
+          complete: outcome.complete,
+        });
       },
+
+      clearNotifications: () => commit((s) => ({ ...s, notifications: [] })),
 
       spotDeal: (input) => {
         const name = input.businessName.trim();
@@ -372,58 +776,65 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         })),
 
       registerBusiness: (input) => {
-        const name = input.name.trim();
-        if (name.length < 2) return fail('Enter your business name.');
-        if (input.address.trim().length < 4) return fail('Enter a street address.');
-        const biz: Business = {
-          id: uid('biz'),
-          ownerId: DEMO_OWNER_ID,
-          name,
-          category: input.category,
-          emoji: input.emoji,
-          address: input.address.trim(),
-          lat: input.lat,
-          lng: input.lng,
-          blurb: input.blurb.trim(),
-          tier: 'free',
-          status: 'pending',
-          createdAt: new Date().toISOString(),
-        };
-        commit((s) => ({
-          ...s,
-          businesses: [...s.businesses, biz],
+        const s = get();
+        if (!s.sessionAccountId) return fail('Sign in to add a business.');
+        const built = buildBusiness(s.sessionAccountId, input);
+        if (!built.ok) return fail(built.error);
+        const { biz, draft } = built.data;
+        commit((st) => ({
+          ...st,
+          businesses: [...st.businesses, biz],
+          deals: [draft, ...st.deals],
           activeBusinessId: biz.id,
         }));
-        notify('Submitted for review');
+        notify('Submitted. We drafted your first deal for you.');
         return ok(biz);
       },
 
-      upgradeTier: (businessId, tier) => {
+      upgradeTier: (businessId, tier, billing = 'monthly') => {
         patchBusiness(businessId, { tier });
-        notify(tier === 'pro' ? 'Welcome to Pro!' : 'Switched to the Free plan', 'info');
+        notify(
+          tier === 'pro'
+            ? `Welcome to Pro (${billing === 'annual' ? 'annual, 2 months free' : 'monthly'})!`
+            : 'Switched to the Free Starter plan',
+          'info',
+        );
+      },
+
+      enrollPilot: (businessId) => {
+        const s = get();
+        const t = Date.now();
+        const biz = s.businesses.find((b) => b.id === businessId);
+        if (!biz) return fail('Business not found.');
+        if (isPilotActive(biz, t)) return fail('Already in the pilot.');
+        if (pilotSlotsUsed(s, t) >= PILOT_SLOTS) {
+          return fail(`All ${PILOT_SLOTS} pilot spots are taken.`);
+        }
+        patchBusiness(businessId, { pilotEndsAt: new Date(t + PILOT_DAYS * DAY).toISOString() });
+        notify(`${biz.name} joined the pilot: Pro free for ${PILOT_DAYS / 30} months`);
+        return ok(undefined);
+      },
+
+      endPilot: (businessId) => {
+        patchBusiness(businessId, { pilotEndsAt: null });
+        notify('Pilot ended', 'info');
       },
 
       createDeal: (input) => {
         const s = get();
         const t = Date.now();
         const biz = s.businesses.find((b) => b.id === input.businessId);
-        if (!biz) return fail('Business not found.');
-        if (biz.status !== 'approved') {
-          return fail('Your business must be approved before you can publish deals.');
-        }
-        const limits = TIER_LIMITS[biz.tier];
-        if (countActiveDeals(s, biz.id, t) >= limits.maxActiveDeals) {
-          return fail(
-            biz.tier === 'free'
-              ? 'The Free plan allows 1 active deal. Pause it or upgrade to Pro.'
-              : `You have reached the limit of ${limits.maxActiveDeals} active deals.`,
-          );
-        }
+        const blocked = publishChecks(biz, t);
+        if (blocked || !biz) return fail(blocked ?? 'Business not found.');
+        const pro = limitsFor(biz, t).proBuilder;
+
         const title = input.title.trim();
         if (title.length < 3 || title.length > 60) return fail('Title must be 3 to 60 characters.');
-        if (!limits.customCoupons && (input.kind === 'bogo' || input.kind === 'freebie')) {
-          return fail('BOGO and free-gift coupons are a Pro feature.');
+
+        if (!pro && input.kind !== 'percent' && input.kind !== 'amount') {
+          return fail('BOGO, free-item and bundle offers are Pro features.');
         }
+
         let value = Math.round(input.value);
         if (input.kind === 'percent' && (value < 1 || value > 90)) {
           return fail('Percent off must be between 1 and 90.');
@@ -431,18 +842,74 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (input.kind === 'amount' && (value < 1 || value > 500)) {
           return fail('Amount off must be between $1 and $500.');
         }
-        if (input.kind === 'bogo') value = 1;
-        if (input.kind === 'freebie') value = 0;
-        const code = input.code.trim().toUpperCase();
-        if (!/^[A-Z0-9]{3,12}$/.test(code)) return fail('Code must be 3 to 12 letters or numbers.');
+        if (input.kind === 'bundle' && (value < 1 || value > 1000)) {
+          return fail('Bundle price must be between $1 and $1000.');
+        }
+        if (input.kind === 'bogo' || input.kind === 'freebie') value = 0;
+        const buyQty = Math.min(10, Math.max(1, Math.round(input.buyQty)));
+        const getQty = Math.min(10, Math.max(1, Math.round(input.getQty)));
 
-        const durationDays = limits.customCoupons
-          ? Math.min(30, Math.max(1, Math.round(input.durationDays)))
-          : FREE_DEAL_DURATION_DAYS;
-        const claimLimit =
-          limits.customCoupons && input.claimLimit && input.claimLimit > 0
-            ? Math.round(input.claimLimit)
-            : null;
+        const code = input.code.trim().toUpperCase();
+        if (!/^[A-Z0-9]{3,15}$/.test(code)) return fail('Code must be 3 to 15 letters or numbers.');
+
+        // Free Starter only gets the basics: everything else is reset to defaults.
+        const punchVisits = pro ? input.punchVisits : 1;
+        let perCustomerLimit = pro ? input.perCustomerLimit : 'once';
+        if (punchVisits > 1 && perCustomerLimit === 'once') perCustomerLimit = 'unlimited';
+        const minSpend = pro && input.minSpend && input.minSpend > 0 ? Math.round(input.minSpend) : null;
+        const claimLimit = pro && input.claimLimit && input.claimLimit > 0 ? Math.round(input.claimLimit) : null;
+        const brandColor = pro && HEX.test(input.brandColor) ? input.brandColor : DEFAULT_BRAND_COLOR;
+        const redemptionMethod = pro ? input.redemptionMethod : 'qr';
+
+        let shareUpgrade = pro ? input.shareUpgrade : null;
+        if (shareUpgrade) {
+          if (input.kind !== 'percent' && input.kind !== 'amount') {
+            return fail('Share-to-upgrade works with percent-off or dollar-off deals.');
+          }
+          const max = input.kind === 'percent' ? 90 : 500;
+          if (shareUpgrade.upgradedValue <= value || shareUpgrade.upgradedValue > max) {
+            return fail('The upgraded offer must be bigger than the base offer.');
+          }
+          shareUpgrade = {
+            friendsNeeded: shareUpgrade.friendsNeeded,
+            upgradedValue: Math.round(shareUpgrade.upgradedValue),
+          };
+        }
+
+        let partnerBusinessId: string | null = null;
+        if (pro && input.partnerBusinessId) {
+          const partner = s.businesses.find((b) => b.id === input.partnerBusinessId);
+          if (!partner || partner.status !== 'approved' || partner.id === biz.id) {
+            return fail('Pick an approved neighboring business for your Main Street Loop.');
+          }
+          partnerBusinessId = partner.id;
+        }
+
+        let expirationMode = pro ? input.expirationMode : 'fixed';
+        let expiresAt: number;
+        let rollingHours: number | null = null;
+        let recurring = null as CreateDealInput['recurring'];
+        if (expirationMode === 'rolling') {
+          rollingHours = Math.round(input.rollingHours ?? 0);
+          if (rollingHours < 1 || rollingHours > 720) return fail('Rolling timer must be 1 to 720 hours.');
+          expiresAt = t + 30 * DAY;
+        } else if (expirationMode === 'recurring') {
+          const r = input.recurring;
+          if (!r || r.days.length === 0) return fail('Pick at least one day for the recurring schedule.');
+          if (r.startHour >= r.endHour) return fail('The end hour must be after the start hour.');
+          recurring = { days: [...r.days].sort((a, b) => a - b), startHour: r.startHour, endHour: r.endHour };
+          expiresAt = t + 90 * DAY;
+        } else {
+          expirationMode = 'fixed';
+          if (!pro) {
+            expiresAt = t + FREE_DEAL_DURATION_DAYS * DAY;
+          } else {
+            const end = new Date(`${input.expiresOn}T23:59:59`).getTime();
+            if (!Number.isFinite(end) || end <= t) return fail('Pick an end date in the future.');
+            if (end > t + 90 * DAY) return fail('Fixed end dates can be at most 90 days out.');
+            expiresAt = end;
+          }
+        }
 
         const deal: Deal = {
           id: uid('deal'),
@@ -451,53 +918,161 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           description: input.description.trim(),
           kind: input.kind,
           value,
+          buyQty,
+          getQty,
           terms: input.terms.trim(),
           code,
-          createdAt: new Date(t).toISOString(),
-          expiresAt: new Date(t + durationDays * DAY).toISOString(),
-          status: 'live',
+          minSpend,
+          punchVisits,
+          perCustomerLimit,
+          shareUpgrade,
+          partnerBusinessId,
+          expirationMode,
+          expiresAt: new Date(expiresAt).toISOString(),
+          rollingHours,
+          recurring,
           claimLimit,
+          brandColor,
+          redemptionMethod,
+          concierge: false,
+          createdAt: new Date(t).toISOString(),
+          status: 'live',
           viewCount: 0,
-          theme: limits.customCoupons ? input.theme : 'indigo',
         };
         commit((st) => ({ ...st, deals: [deal, ...st.deals] }));
         notify('Deal published');
         return ok(deal);
       },
 
-      setDealStatus: (dealId, status) => {
-        commit((s) => ({
-          ...s,
-          deals: s.deals.map((d) => (d.id === dealId ? { ...d, status } : d)),
-        }));
-        notify(status === 'paused' ? 'Deal paused' : 'Deal is live again', 'info');
+      publishDraft: (dealId) => {
+        const s = get();
+        const t = Date.now();
+        const deal = s.deals.find((d) => d.id === dealId);
+        if (!deal || deal.status !== 'draft') return fail('That draft is no longer available.');
+        const biz = s.businesses.find((b) => b.id === deal.businessId);
+        const blocked = publishChecks(biz, t);
+        if (blocked) return fail(blocked);
+        const live: Deal = {
+          ...deal,
+          status: 'live',
+          createdAt: new Date(t).toISOString(),
+          expiresAt: new Date(t + 14 * DAY).toISOString(),
+        };
+        commit((st) => ({ ...st, deals: st.deals.map((d) => (d.id === dealId ? live : d)) }));
+        notify('You are live!');
+        return ok(live);
       },
 
-      sendBlast: (businessId, message, radiusMiles) => {
+      discardDraft: (dealId) => {
+        commit((s) => ({ ...s, deals: s.deals.filter((d) => !(d.id === dealId && d.status === 'draft')) }));
+        notify('Draft discarded', 'info');
+      },
+
+      setDealStatus: (dealId, status) => {
+        const deal = get().deals.find((d) => d.id === dealId);
+        if (!deal || (deal.status !== 'live' && deal.status !== 'paused')) return;
+        patchDeal(dealId, { status });
+        notify(
+          status === 'paused'
+            ? 'Paused: passes show "paused" until you resume'
+            : 'Live again: existing passes reactivated, no re-download needed',
+          'info',
+        );
+      },
+
+      endDeal: (dealId) => {
+        const s = get();
+        const deal = s.deals.find((d) => d.id === dealId);
+        if (!deal || deal.status === 'ended') return;
+        const biz = s.businesses.find((b) => b.id === deal.businessId);
+        const holdsPass = s.passes.some(
+          (p) => p.dealId === dealId && p.consumerId === s.consumer.id && !p.redeemedAt,
+        );
+        commit((st) => ({
+          ...st,
+          deals: st.deals.map((d) => (d.id === dealId ? { ...d, status: 'ended' as const } : d)),
+          notifications: holdsPass
+            ? addNote(
+                st.notifications,
+                'ended',
+                `${biz ? biz.name : 'A merchant'} ended "${deal.title}". Your pass moved to Expired Passes.`,
+              )
+            : st.notifications,
+        }));
+        notify('Deal ended on every phone', 'info');
+      },
+
+      sendPassPush: (businessId, message) => {
         const s = get();
         const t = Date.now();
         const biz = s.businesses.find((b) => b.id === businessId);
         if (!biz) return fail('Business not found.');
         if (biz.status !== 'approved') return fail('Your business must be approved first.');
-        const limits = TIER_LIMITS[biz.tier];
-        if (limits.blastsPerMonth === 0) return fail('Blasts are a Pro feature.');
-        if (blastsThisMonth(s, biz.id, t) >= limits.blastsPerMonth) {
-          return fail(`You have used all ${limits.blastsPerMonth} blasts for this month.`);
-        }
+        if (!limitsFor(biz, t).passPush) return fail('Pass Push is a Pro feature.');
         const text = message.trim();
-        if (text.length < BLAST_MIN_CHARS) return fail('Write a little more (at least 10 characters).');
-        if (text.length > BLAST_MAX_CHARS) return fail(`Keep it under ${BLAST_MAX_CHARS} characters.`);
-        const blast: Blast = {
-          id: uid('blast'),
+        if (text.length < PUSH_MIN_CHARS) return fail('Write a little more (at least 10 characters).');
+        if (text.length > PUSH_MAX_CHARS) return fail(`Keep it under ${PUSH_MAX_CHARS} characters.`);
+        const holders = passHolders(s, biz.id, t);
+        if (holders.length === 0) return fail('Nobody holds an active pass yet.');
+        const push: PassPush = {
+          id: uid('push'),
           businessId: biz.id,
           message: text,
-          radiusMiles,
-          reach: estimateReach(radiusMiles),
+          recipients: holders.length,
           sentAt: new Date(t).toISOString(),
         };
-        commit((st) => ({ ...st, blasts: [blast, ...st.blasts] }));
-        notify(`Blast sent to about ${blast.reach} neighbors`);
-        return ok(blast);
+        const consumerHolds = holders.some((p) => p.consumerId === s.consumer.id);
+        commit((st) => ({
+          ...st,
+          pushes: [push, ...st.pushes],
+          notifications: consumerHolds
+            ? addNote(st.notifications, 'push', `${biz.name}: ${text}`)
+            : st.notifications,
+        }));
+        notify(`Pass Push delivered to ${push.recipients} phones`);
+        return ok(push);
+      },
+
+      sendDrop: (businessId, dealId, message, radiusMiles) => {
+        const s = get();
+        const t = Date.now();
+        const biz = s.businesses.find((b) => b.id === businessId);
+        if (!biz) return fail('Business not found.');
+        if (biz.status !== 'approved') return fail('Your business must be approved first.');
+        const limits = limitsFor(biz, t);
+        if (limits.dropsPerMonth === 0) return fail('Neighborhood Drops are a Pro feature.');
+        if (dropsThisMonth(s, biz.id, t) >= limits.dropsPerMonth) {
+          return fail(`You have used all ${limits.dropsPerMonth} drops for this month.`);
+        }
+        const deal = s.deals.find((d) => d.id === dealId && d.businessId === biz.id);
+        if (!deal || !isDealLive(deal, s, t)) return fail('Pick one of your live deals to send.');
+        const text = message.trim();
+        if (text.length < PUSH_MIN_CHARS) return fail('Write a little more (at least 10 characters).');
+        if (text.length > PUSH_MAX_CHARS) return fail(`Keep it under ${PUSH_MAX_CHARS} characters.`);
+        if (!(radiusMiles >= DROP_MIN_MILES && radiusMiles <= DROP_MAX_MILES)) {
+          return fail(`Choose a radius between ${DROP_MIN_MILES} and ${DROP_MAX_MILES} miles.`);
+        }
+        const drop: Drop = {
+          id: uid('drop'),
+          businessId: biz.id,
+          dealId: deal.id,
+          message: text,
+          radiusMiles,
+          reach: estimateDropReach(radiusMiles),
+          sentAt: new Date(t).toISOString(),
+        };
+        // The demo shopper receives it only if opted in AND physically inside the radius.
+        const inside = haversineMiles(s.consumer, biz) <= radiusMiles;
+        const delivered = s.consumer.notifyNearby && inside;
+        commit((st) => ({
+          ...st,
+          drops: [drop, ...st.drops],
+          notifications: delivered
+            ? addNote(st.notifications, 'drop', `${biz.name} is nearby: ${text}`, deal.id)
+            : st.notifications,
+        }));
+        notify(`Drop sent to about ${drop.reach} nearby shoppers`);
+        return ok({ drop, deliveredToDemoShopper: delivered });
       },
 
       approveBusiness: (id) => {
@@ -528,8 +1103,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         notify(approve ? 'Community deal approved' : 'Community deal rejected', 'info');
       },
 
-      resetDemo: () => {
-        commit((s) => ({ ...buildSeed(Date.now()), role: s.role }));
+      resetDemo: async () => {
+        const fresh = await buildInitialState(Date.now());
+        commit(() => fresh);
         notify('Demo data reset', 'info');
       },
     };
@@ -537,9 +1113,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const api = useMemo<StoreApi | null>(() => {
     if (!state) return null;
-    const owned = state.businesses.filter((b) => b.ownerId === DEMO_OWNER_ID);
+    const account = state.accounts.find((a) => a.id === state.sessionAccountId) ?? null;
+    const owned = account ? state.businesses.filter((b) => b.ownerId === account.id) : [];
     const active = owned.find((b) => b.id === state.activeBusinessId) ?? owned[0] ?? null;
-    return { ...actions, state, now, ownedBusinesses: owned, activeBusiness: active };
+    return { ...actions, state, now, account, ownedBusinesses: owned, activeBusiness: active };
   }, [actions, state, now]);
 
   if (!api) {
@@ -557,7 +1134,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         <div
           key={toast.id}
           role="status"
-          className="pointer-events-none fixed left-1/2 top-16 z-[70] w-[calc(100%-2rem)] max-w-sm animate-pop-in"
+          className="pointer-events-none fixed left-1/2 top-4 z-[70] w-[calc(100%-2rem)] max-w-sm animate-pop-in"
         >
           <div
             className={`rounded-2xl px-4 py-3 text-center text-sm font-semibold shadow-lg ${TOAST_STYLES[toast.tone]}`}

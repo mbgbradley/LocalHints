@@ -66,9 +66,9 @@ export function ConsumerProfileDrawer({ open, onClose }: ConsumerProfileDrawerPr
             <p className="text-2xl font-black text-hint-700">{consumer.points}</p>
             <p className="text-[11px] font-semibold uppercase tracking-wide text-hint-600">Points</p>
           </div>
-          <div className="rounded-2xl bg-slate-100 p-3">
-            <p className="text-2xl font-black text-slate-800">{myPasses.length}</p>
-            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">Passes</p>
+          <div className="rounded-2xl bg-neutral-100 p-3">
+            <p className="text-2xl font-black text-neutral-800">{myPasses.length}</p>
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">Passes</p>
           </div>
           <div className="rounded-2xl bg-emerald-50 p-3">
             <p className="text-2xl font-black text-emerald-700">{redeemedCount}</p>
@@ -76,24 +76,24 @@ export function ConsumerProfileDrawer({ open, onClose }: ConsumerProfileDrawerPr
           </div>
         </div>
 
-        <p className="rounded-xl bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-600">
+        <p className="rounded-xl bg-neutral-50 px-3 py-2 text-xs leading-relaxed text-neutral-600">
           Earn <b>{POINTS.claim}</b> points for adding a pass, <b>{POINTS.redeem}</b> for redeeming it and{' '}
           <b>{POINTS.spotApproved}</b> for each community deal you spot that gets approved.
         </p>
 
         <label className="block">
-          <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Name</span>
+          <span className="text-xs font-semibold uppercase tracking-wide text-neutral-500">Name</span>
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
             onBlur={saveName}
-            className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-3 text-base outline-none focus:border-hint-500 focus:ring-2 focus:ring-hint-200"
+            className="mt-1 w-full rounded-xl border border-neutral-300 px-3 py-3 text-base outline-none focus:border-hint-500 focus:ring-2 focus:ring-hint-200"
           />
         </label>
 
         <div>
           <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            <span className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
               Search radius
             </span>
             <span className="text-sm font-bold text-hint-700">{consumer.radiusMiles} mi</span>
@@ -110,8 +110,24 @@ export function ConsumerProfileDrawer({ open, onClose }: ConsumerProfileDrawerPr
           />
         </div>
 
+        <label className="flex items-start justify-between gap-4 rounded-2xl bg-neutral-50 p-4">
+          <span>
+            <span className="block text-sm font-semibold text-neutral-900">Nearby deal alerts</span>
+            <span className="mt-0.5 block text-xs leading-relaxed text-neutral-500">
+              Let businesses within your radius send you a deal. You choose whether to add it to your wallet.
+            </span>
+          </span>
+          <input
+            type="checkbox"
+            checked={consumer.notifyNearby}
+            onChange={(e) => updateConsumer({ notifyNearby: e.target.checked })}
+            className="mt-1 h-6 w-11 shrink-0 cursor-pointer accent-hint-600"
+            aria-label="Nearby deal alerts"
+          />
+        </label>
+
         <div>
-          <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+          <span className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
             Favorite categories
           </span>
           <div className="mt-2 flex flex-wrap gap-2">
@@ -123,7 +139,7 @@ export function ConsumerProfileDrawer({ open, onClose }: ConsumerProfileDrawerPr
                   type="button"
                   onClick={() => toggleCategory(c.id)}
                   className={`rounded-full px-3 py-2 text-sm font-semibold ${
-                    on ? 'bg-hint-600 text-white' : 'bg-slate-100 text-slate-700 active:bg-slate-200'
+                    on ? 'bg-hint-600 text-white' : 'bg-neutral-100 text-neutral-700 active:bg-neutral-200'
                   }`}
                 >
                   {c.emoji} {c.label}
@@ -131,25 +147,25 @@ export function ConsumerProfileDrawer({ open, onClose }: ConsumerProfileDrawerPr
               );
             })}
           </div>
-          <p className="mt-1 text-xs text-slate-500">Favorites are shown first in your feed.</p>
+          <p className="mt-1 text-xs text-neutral-500">Favorites are shown first in your feed.</p>
         </div>
 
         <div>
-          <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Location</span>
-          <p className="mt-1 text-sm text-slate-700">📍 {consumer.locationLabel}</p>
+          <span className="text-xs font-semibold uppercase tracking-wide text-neutral-500">Location</span>
+          <p className="mt-1 text-sm text-neutral-700">📍 {consumer.locationLabel}</p>
           <div className="mt-2 grid grid-cols-2 gap-2">
             <button
               type="button"
               onClick={useMyLocation}
               disabled={locating}
-              className="rounded-xl bg-slate-900 py-3 text-sm font-bold text-white disabled:opacity-60"
+              className="rounded-xl bg-neutral-900 py-3 text-sm font-bold text-white disabled:opacity-60"
             >
               {locating ? 'Locating…' : 'Use my location'}
             </button>
             <button
               type="button"
               onClick={useDemoDistrict}
-              className="rounded-xl bg-white py-3 text-sm font-bold text-slate-800 ring-1 ring-slate-300"
+              className="rounded-xl bg-white py-3 text-sm font-bold text-neutral-800 ring-1 ring-neutral-300"
             >
               Demo district
             </button>

@@ -1,28 +1,32 @@
 import { DEFAULT_CENTER } from '@/lib/geo';
-import type {
-  AppState,
-  Blast,
-  Business,
-  Category,
-  Deal,
-  DealKind,
-  Pass,
-  PassTheme,
-  SpottedDeal,
+import {
+  DEFAULT_BRAND_COLOR,
+  type AppState,
+  type Business,
+  type Category,
+  type Deal,
+  type Pass,
+  type PassPush,
+  type SpottedDeal,
 } from '@/types/localhints';
 
 export const DEMO_CONSUMER_ID = 'consumer-demo';
-/** The business owner the "Business" role plays. Owns biz-bean (Pro) and biz-sunny (Free). */
-export const DEMO_OWNER_ID = 'owner-demo';
+/** Demo business login. Owns biz-bean (Pro), biz-sunny (Free) and biz-taco (pilot). The account record is created asynchronously in the store (password hashing is async). */
+export const DEMO_ACCOUNT_ID = 'acct-demo';
+export const DEMO_EMAIL = 'owner@brewandbean.demo';
+export const DEMO_PASSWORD = 'demo1234';
 
-/** Static neighborhood benchmarks (percent). Swap for a SQL aggregate later. */
+/**
+ * Static neighborhood benchmarks (percent). Swap for a SQL aggregate later.
+ * claimRate = saves / views, redeemRate = redemptions / saves.
+ */
 export const CATEGORY_BENCHMARKS: Record<Category, { claimRate: number; redeemRate: number }> = {
-  food: { claimRate: 13, redeemRate: 52 },
-  coffee: { claimRate: 12, redeemRate: 48 },
-  retail: { claimRate: 11, redeemRate: 41 },
-  wellness: { claimRate: 10, redeemRate: 36 },
-  services: { claimRate: 9, redeemRate: 44 },
-  entertainment: { claimRate: 14, redeemRate: 39 },
+  food: { claimRate: 13, redeemRate: 19 },
+  coffee: { claimRate: 12, redeemRate: 24 },
+  retail: { claimRate: 11, redeemRate: 21 },
+  wellness: { claimRate: 10, redeemRate: 18 },
+  services: { claimRate: 9, redeemRate: 22 },
+  entertainment: { claimRate: 14, redeemRate: 20 },
 };
 
 /** Assumed average ticket (USD) per category, for the "revenue influenced" estimate. */
@@ -45,34 +49,143 @@ const at = (dLat: number, dLng: number): { lat: number; lng: number } => ({
   lng: DEFAULT_CENTER.lng + dLng,
 });
 
-interface DealSpec {
-  id: string;
-  businessId: string;
-  title: string;
-  description: string;
-  kind: DealKind;
-  value: number;
-  terms: string;
-  code: string;
-  expiresInDays: number;
-  claimLimit: number | null;
-  viewCount: number;
-  theme: PassTheme;
-  claims: number;
-  redeemed: number;
+/**
+ * "Concierge first deal": a ready-to-launch draft generated from a business's public info,
+ * so a new owner only has to preview it and tap Go Live (zero typing).
+ */
+export function conciergeDealFor(biz: Business, now: number, id: string): Deal {
+  const templates: Record<
+    Category,
+    { title: string; kind: Deal['kind']; value: number; description: string }
+  > = {
+    coffee: {
+      title: 'Free pastry with any drink',
+      kind: 'freebie',
+      value: 0,
+      description: `Pick any pastry when you order a drink at ${biz.name}.`,
+    },
+    food: {
+      title: 'Free appetizer with any entree',
+      kind: 'freebie',
+      value: 0,
+      description: `Start your meal at ${biz.name} with a free appetizer.`,
+    },
+    retail: {
+      title: '10% off your first purchase',
+      kind: 'percent',
+      value: 10,
+      description: `Welcome to ${biz.name}. Show this pass at checkout.`,
+    },
+    wellness: {
+      title: 'Free 3-day trial pass',
+      kind: 'freebie',
+      value: 0,
+      description: `Try everything ${biz.name} offers, no commitment.`,
+    },
+    services: {
+      title: '15% off your first visit',
+      kind: 'percent',
+      value: 15,
+      description: `New customers save at ${biz.name}.`,
+    },
+    entertainment: {
+      title: '$3 off any ticket',
+      kind: 'amount',
+      value: 3,
+      description: `Enjoy a night out at ${biz.name} for less.`,
+    },
+  };
+  const t = templates[biz.category];
+  const prefix = biz.name.replace(/[^a-zA-Z]/g, '').slice(0, 4).toUpperCase() || 'HINT';
+  return {
+    id,
+    businessId: biz.id,
+    title: t.title,
+    description: t.description,
+    kind: t.kind,
+    value: t.value,
+    buyQty: 1,
+    getQty: 1,
+    terms: 'One per customer. Show this pass at the counter.',
+    code: `${prefix}${t.kind === 'freebie' ? 'FREE' : t.value}`,
+    minSpend: null,
+    punchVisits: 1,
+    perCustomerLimit: 'once',
+    shareUpgrade: null,
+    partnerBusinessId: null,
+    expirationMode: 'fixed',
+    expiresAt: iso(now + 14 * DAY),
+    rollingHours: null,
+    recurring: null,
+    claimLimit: null,
+    brandColor: DEFAULT_BRAND_COLOR,
+    redemptionMethod: 'qr',
+    concierge: true,
+    createdAt: iso(now),
+    status: 'draft',
+    viewCount: 0,
+  };
 }
 
-function genPasses(spec: DealSpec, now: number): Pass[] {
+/** Everything a seed deal needs to say; defaults fill the rest. */
+type DealSpec = Partial<Deal> &
+  Pick<Deal, 'id' | 'businessId' | 'title' | 'description' | 'kind' | 'code' | 'brandColor'> & {
+    expiresInDays: number;
+    claims: number;
+    redeemed: number;
+  };
+
+function toDeal(s: DealSpec, now: number): Deal {
+  return {
+    id: s.id,
+    businessId: s.businessId,
+    title: s.title,
+    description: s.description,
+    kind: s.kind,
+    value: s.value ?? 0,
+    buyQty: s.buyQty ?? 1,
+    getQty: s.getQty ?? 1,
+    terms: s.terms ?? '',
+    code: s.code,
+    minSpend: s.minSpend ?? null,
+    punchVisits: s.punchVisits ?? 1,
+    perCustomerLimit: s.perCustomerLimit ?? 'once',
+    shareUpgrade: s.shareUpgrade ?? null,
+    partnerBusinessId: s.partnerBusinessId ?? null,
+    expirationMode: s.expirationMode ?? 'fixed',
+    expiresAt: iso(now + s.expiresInDays * DAY),
+    rollingHours: s.rollingHours ?? null,
+    recurring: s.recurring ?? null,
+    claimLimit: s.claimLimit ?? null,
+    brandColor: s.brandColor,
+    redemptionMethod: s.redemptionMethod ?? 'qr',
+    concierge: false,
+    createdAt: iso(now - (s.expiresInDays < 0 ? 14 : 5) * DAY),
+    status: 'live',
+    viewCount: s.viewCount ?? 0,
+  };
+}
+
+function genPasses(deal: Deal, claims: number, redeemed: number, now: number): Pass[] {
   const out: Pass[] = [];
-  for (let i = 0; i < spec.claims; i++) {
+  const slug = deal.code.slice(0, 4).toLowerCase();
+  for (let i = 0; i < claims; i++) {
     const claimedAt = now - ((i % 48) + 1) * HOUR;
+    const done = i < redeemed;
+    const stamps = done ? deal.punchVisits : deal.punchVisits > 1 ? i % deal.punchVisits : 0;
+    const completes = done && (deal.punchVisits > 1 || deal.perCustomerLimit === 'once');
     out.push({
-      id: `seedpass-${spec.id}-${i}`,
-      dealId: spec.id,
+      id: `seedpass-${deal.id}-${i}`,
+      dealId: deal.id,
       consumerId: `seed-user-${i}`,
-      code: `${spec.code}-S${String(i).padStart(3, '0')}`,
+      code: `${deal.code}-S${String(i).padStart(3, '0')}`,
+      referralCode: `s${i}-${slug}`,
+      referredBy: null,
       claimedAt: iso(claimedAt),
-      redeemedAt: i < spec.redeemed ? iso(claimedAt + 20 * 60_000) : null,
+      stamps: done ? Math.max(1, stamps) : stamps,
+      friendSaves: i % 5 === 0 ? 1 : 0,
+      lastRedeemedAt: done ? iso(claimedAt + 20 * 60_000) : null,
+      redeemedAt: completes ? iso(claimedAt + 20 * 60_000) : null,
     });
   }
   return out;
@@ -82,7 +195,7 @@ export function buildSeed(now: number): AppState {
   const businesses: Business[] = [
     {
       id: 'biz-bean',
-      ownerId: DEMO_OWNER_ID,
+      ownerId: DEMO_ACCOUNT_ID,
       name: 'Brew & Bean Coffee',
       category: 'coffee',
       emoji: '☕',
@@ -91,11 +204,12 @@ export function buildSeed(now: number): AppState {
       blurb: 'Small-batch roasts and fresh pastries, baked every morning.',
       tier: 'pro',
       status: 'approved',
+      pilotEndsAt: null,
       createdAt: iso(now - 90 * DAY),
     },
     {
       id: 'biz-sunny',
-      ownerId: DEMO_OWNER_ID,
+      ownerId: DEMO_ACCOUNT_ID,
       name: 'Sunny Side Bakery',
       category: 'food',
       emoji: '🥐',
@@ -104,7 +218,22 @@ export function buildSeed(now: number): AppState {
       blurb: 'Sourdough, croissants and custom cakes.',
       tier: 'free',
       status: 'approved',
+      pilotEndsAt: null,
       createdAt: iso(now - 40 * DAY),
+    },
+    {
+      id: 'biz-taco',
+      ownerId: DEMO_ACCOUNT_ID,
+      name: 'Taco Lantern',
+      category: 'food',
+      emoji: '🌮',
+      address: '91 Lantern Row',
+      ...at(0.003, 0.005),
+      blurb: 'Street-style tacos and agua fresca.',
+      tier: 'free',
+      status: 'approved',
+      pilotEndsAt: iso(now + 52 * DAY),
+      createdAt: iso(now - 8 * DAY),
     },
     {
       id: 'biz-iron',
@@ -117,6 +246,7 @@ export function buildSeed(now: number): AppState {
       blurb: 'Strength-focused gym with no contracts.',
       tier: 'pro',
       status: 'approved',
+      pilotEndsAt: null,
       createdAt: iso(now - 120 * DAY),
     },
     {
@@ -130,20 +260,8 @@ export function buildSeed(now: number): AppState {
       blurb: 'Independent bookstore with a reading nook.',
       tier: 'free',
       status: 'approved',
+      pilotEndsAt: null,
       createdAt: iso(now - 200 * DAY),
-    },
-    {
-      id: 'biz-taco',
-      ownerId: 'owner-4',
-      name: 'Taco Lantern',
-      category: 'food',
-      emoji: '🌮',
-      address: '91 Lantern Row',
-      ...at(0.003, 0.005),
-      blurb: 'Street-style tacos and agua fresca.',
-      tier: 'pro',
-      status: 'approved',
-      createdAt: iso(now - 75 * DAY),
     },
     {
       id: 'biz-spin',
@@ -156,6 +274,7 @@ export function buildSeed(now: number): AppState {
       blurb: 'Self-serve and wash-and-fold, open late.',
       tier: 'free',
       status: 'approved',
+      pilotEndsAt: null,
       createdAt: iso(now - 150 * DAY),
     },
     {
@@ -169,6 +288,7 @@ export function buildSeed(now: number): AppState {
       blurb: 'Neighborhood cinema with classics and new releases.',
       tier: 'pro',
       status: 'approved',
+      pilotEndsAt: null,
       createdAt: iso(now - 260 * DAY),
     },
     {
@@ -182,6 +302,7 @@ export function buildSeed(now: number): AppState {
       blurb: 'Seasonal bouquets and workshop classes.',
       tier: 'free',
       status: 'pending',
+      pilotEndsAt: null,
       createdAt: iso(now - 1 * DAY),
     },
   ];
@@ -193,15 +314,30 @@ export function buildSeed(now: number): AppState {
       title: 'BOGO lattes before 10am',
       description: 'Buy any latte, get a second one free. Perfect for sharing the morning rush.',
       kind: 'bogo',
-      value: 1,
-      terms: 'Valid until 10am. Equal or lesser value. One per customer.',
+      terms: 'Valid until 10am. Equal or lesser value.',
       code: 'BEANBOGO',
+      brandColor: '#d97706',
       expiresInDays: 3,
-      claimLimit: null,
       viewCount: 412,
-      theme: 'amber',
       claims: 58,
       redeemed: 31,
+    },
+    {
+      id: 'deal-bean-punch',
+      businessId: 'biz-bean',
+      title: 'Buy 4 lattes, the 5th is free',
+      description: 'A stamp card that lives in your phone. Collect 5 visits and the next latte is on us.',
+      kind: 'freebie',
+      terms: 'One stamp per visit.',
+      code: 'BEANCARD',
+      brandColor: '#78350f',
+      punchVisits: 5,
+      perCustomerLimit: 'unlimited',
+      redemptionMethod: 'tap',
+      expiresInDays: 25,
+      viewCount: 266,
+      claims: 40,
+      redeemed: 6,
     },
     {
       id: 'deal-bean-pastry',
@@ -209,13 +345,13 @@ export function buildSeed(now: number): AppState {
       title: 'Free pastry with any large drink',
       description: 'Pick any pastry from the case when you order a large drink.',
       kind: 'freebie',
-      value: 0,
       terms: 'While supplies last. Dine-in or takeaway.',
       code: 'BEANPASTRY',
-      expiresInDays: 6,
+      brandColor: '#e11d48',
+      partnerBusinessId: 'biz-sunny',
       claimLimit: 120,
+      expiresInDays: 6,
       viewCount: 188,
-      theme: 'rose',
       claims: 21,
       redeemed: 9,
     },
@@ -228,10 +364,9 @@ export function buildSeed(now: number): AppState {
       value: 25,
       terms: 'Seasonal menu only.',
       code: 'PUMPKIN25',
+      brandColor: '#d97706',
       expiresInDays: -1,
-      claimLimit: null,
       viewCount: 355,
-      theme: 'amber',
       claims: 74,
       redeemed: 49,
     },
@@ -244,12 +379,44 @@ export function buildSeed(now: number): AppState {
       value: 20,
       terms: 'One loaf per visit.',
       code: 'SUNNY20',
+      brandColor: '#4f46e5',
       expiresInDays: 5,
-      claimLimit: null,
       viewCount: 134,
-      theme: 'indigo',
       claims: 17,
       redeemed: 8,
+    },
+    {
+      id: 'deal-taco-tue',
+      businessId: 'biz-taco',
+      title: 'Taco Tuesday 2-for-1',
+      description: 'Every taco on the menu, two for the price of one. Opens automatically on Tuesdays and Wednesdays.',
+      kind: 'bogo',
+      terms: 'Dine-in only. Equal or lesser value.',
+      code: 'TACO2X1',
+      brandColor: '#e11d48',
+      expirationMode: 'recurring',
+      recurring: { days: [2, 3], startHour: 11, endHour: 22 },
+      partnerBusinessId: 'biz-reel',
+      expiresInDays: 60,
+      viewCount: 620,
+      claims: 88,
+      redeemed: 54,
+    },
+    {
+      id: 'deal-taco-lunch',
+      businessId: 'biz-taco',
+      title: '15% off lunch combos',
+      description: 'Two tacos, rice and a drink for less. Share your pass with a friend to upgrade it.',
+      kind: 'percent',
+      value: 15,
+      terms: 'Weekdays only.',
+      code: 'LUNCH15',
+      brandColor: '#d97706',
+      shareUpgrade: { friendsNeeded: 2, upgradedValue: 25 },
+      expiresInDays: 9,
+      viewCount: 240,
+      claims: 30,
+      redeemed: 12,
     },
     {
       id: 'deal-iron-trial',
@@ -257,13 +424,12 @@ export function buildSeed(now: number): AppState {
       title: 'Free 3-day trial pass',
       description: 'Try every machine, class and the sauna. No credit card needed.',
       kind: 'freebie',
-      value: 0,
       terms: 'New members only. Bring photo ID.',
       code: 'IRON3',
-      expiresInDays: 10,
+      brandColor: '#1e293b',
       claimLimit: 100,
+      expiresInDays: 10,
       viewCount: 540,
-      theme: 'slate',
       claims: 64,
       redeemed: 22,
     },
@@ -276,10 +442,10 @@ export function buildSeed(now: number): AppState {
       value: 25,
       terms: 'Annual or monthly memberships.',
       code: 'JOIN25',
+      brandColor: '#059669',
+      shareUpgrade: { friendsNeeded: 1, upgradedValue: 40 },
       expiresInDays: 4,
-      claimLimit: null,
       viewCount: 210,
-      theme: 'emerald',
       claims: 19,
       redeemed: 7,
     },
@@ -290,46 +456,14 @@ export function buildSeed(now: number): AppState {
       description: 'Grab a new read and a cozy corner to start it in.',
       kind: 'amount',
       value: 5,
+      minSpend: 25,
       terms: 'Excludes gift cards and magazines.',
       code: 'PAGES5',
+      brandColor: '#4f46e5',
       expiresInDays: 8,
-      claimLimit: null,
       viewCount: 96,
-      theme: 'indigo',
       claims: 11,
       redeemed: 6,
-    },
-    {
-      id: 'deal-taco-tue',
-      businessId: 'biz-taco',
-      title: 'Taco Tuesday 2-for-1',
-      description: 'Every taco on the menu, two for the price of one.',
-      kind: 'bogo',
-      value: 1,
-      terms: 'Dine-in only. Equal or lesser value.',
-      code: 'TACO2X1',
-      expiresInDays: 1.2,
-      claimLimit: null,
-      viewCount: 620,
-      theme: 'rose',
-      claims: 88,
-      redeemed: 54,
-    },
-    {
-      id: 'deal-taco-lunch',
-      businessId: 'biz-taco',
-      title: '15% off lunch combos',
-      description: 'Two tacos, rice and a drink for less, weekdays 11am to 2pm.',
-      kind: 'percent',
-      value: 15,
-      terms: 'Weekdays only.',
-      code: 'LUNCH15',
-      expiresInDays: 9,
-      claimLimit: null,
-      viewCount: 240,
-      theme: 'amber',
-      claims: 30,
-      redeemed: 12,
     },
     {
       id: 'deal-spin-wash',
@@ -337,13 +471,11 @@ export function buildSeed(now: number): AppState {
       title: 'Free dry cycle with any wash',
       description: 'Wash a load, dry it on us.',
       kind: 'freebie',
-      value: 0,
       terms: 'Up to one standard dryer. Self-serve only.',
       code: 'DRYFREE',
+      brandColor: '#4f46e5',
       expiresInDays: 7,
-      claimLimit: null,
       viewCount: 73,
-      theme: 'indigo',
       claims: 9,
       redeemed: 4,
     },
@@ -356,52 +488,53 @@ export function buildSeed(now: number): AppState {
       value: 4,
       terms: 'Tickets purchased at the box office.',
       code: 'MATINEE',
-      expiresInDays: 12,
+      brandColor: '#1e293b',
+      redemptionMethod: 'code',
+      partnerBusinessId: 'biz-taco',
       claimLimit: 150,
+      expiresInDays: 12,
       viewCount: 305,
-      theme: 'slate',
       claims: 41,
       redeemed: 17,
     },
   ];
 
-  const deals: Deal[] = specs.map((s) => ({
-    id: s.id,
-    businessId: s.businessId,
-    title: s.title,
-    description: s.description,
-    kind: s.kind,
-    value: s.value,
-    terms: s.terms,
-    code: s.code,
-    createdAt: iso(now - (s.expiresInDays < 0 ? 14 : 5) * DAY),
-    expiresAt: iso(now + s.expiresInDays * DAY),
-    status: 'live',
-    claimLimit: s.claimLimit,
-    viewCount: s.viewCount,
-    theme: s.theme,
-  }));
+  const deals: Deal[] = specs.map((s) => toDeal(s, now));
+  const passes: Pass[] = specs.flatMap((s, i) => genPasses(deals[i], s.claims, s.redeemed, now));
 
-  const passes: Pass[] = specs.flatMap((s) => genPasses(s, now));
-
-  // Two passes for the demo consumer so the wallet is not empty.
+  // Passes for the demo consumer so the wallet shows different pass types.
+  const demo = (p: Partial<Pass> & Pick<Pass, 'id' | 'dealId' | 'code' | 'referralCode'>): Pass => ({
+    consumerId: DEMO_CONSUMER_ID,
+    referredBy: null,
+    claimedAt: iso(now - 2 * HOUR),
+    stamps: 0,
+    friendSaves: 0,
+    lastRedeemedAt: null,
+    redeemedAt: null,
+    ...p,
+  });
   passes.unshift(
-    {
-      id: 'pass-demo-1',
-      dealId: 'deal-taco-tue',
-      consumerId: DEMO_CONSUMER_ID,
-      code: 'TACO2X1-7QK2',
-      claimedAt: iso(now - 2 * HOUR),
-      redeemedAt: null,
-    },
-    {
-      id: 'pass-demo-2',
+    demo({ id: 'pass-demo-lunch', dealId: 'deal-taco-lunch', code: 'LUNCH15-7QK2', referralCode: 'alex-42' }),
+    demo({
+      id: 'pass-demo-card',
+      dealId: 'deal-bean-punch',
+      code: 'BEANCARD-3NPX',
+      referralCode: 'alex-17',
+      claimedAt: iso(now - 3 * DAY),
+      stamps: 2,
+      lastRedeemedAt: iso(now - 1 * DAY),
+    }),
+    demo({ id: 'pass-demo-taco', dealId: 'deal-taco-tue', code: 'TACO2X1-9ZLD', referralCode: 'alex-63' }),
+    demo({
+      id: 'pass-demo-old',
       dealId: 'deal-bean-expired',
-      consumerId: DEMO_CONSUMER_ID,
       code: 'PUMPKIN25-4MXA',
+      referralCode: 'alex-08',
       claimedAt: iso(now - 6 * DAY),
+      stamps: 1,
+      lastRedeemedAt: iso(now - 5 * DAY),
       redeemedAt: iso(now - 5 * DAY),
-    },
+    }),
   );
 
   const spotted: SpottedDeal[] = [
@@ -455,21 +588,21 @@ export function buildSeed(now: number): AppState {
     },
   ];
 
-  const blasts: Blast[] = [
+  const pushes: PassPush[] = [
     {
-      id: 'blast-1',
+      id: 'push-1',
       businessId: 'biz-bean',
-      message: '☕ Rainy day special: BOGO lattes until 10am. Show your LocalHints pass!',
-      radiusMiles: 1.5,
-      reach: 165,
+      message: '☕ Rainy day special: show this pass for a free cookie with any latte!',
+      recipients: 52,
       sentAt: iso(now - 6 * DAY),
     },
   ];
 
   return {
-    version: 1,
-    role: 'consumer',
-    activeBusinessId: 'biz-bean',
+    version: 3,
+    sessionAccountId: null,
+    accounts: [],
+    activeBusinessId: null,
     consumer: {
       id: DEMO_CONSUMER_ID,
       name: 'Alex',
@@ -478,6 +611,7 @@ export function buildSeed(now: number): AppState {
       locationLabel: 'Maple Square (demo district)',
       radiusMiles: 3,
       categories: [],
+      notifyNearby: true,
       points: 120,
       savedDealIds: [],
     },
@@ -485,6 +619,8 @@ export function buildSeed(now: number): AppState {
     deals,
     passes,
     spotted,
-    blasts,
+    pushes,
+    drops: [],
+    notifications: [],
   };
 }

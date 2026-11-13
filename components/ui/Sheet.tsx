@@ -42,22 +42,22 @@ export function Sheet({ open, onClose, title, children, size = 'md' }: SheetProp
         type="button"
         aria-label="Close"
         onClick={onClose}
-        className="no-print absolute inset-0 animate-fade-in bg-slate-900/60"
+        className="no-print absolute inset-0 animate-fade-in bg-neutral-900/60"
       />
       <div
         className={`relative flex max-h-[92vh] w-full animate-slide-up flex-col overflow-hidden rounded-t-3xl bg-white shadow-2xl md:animate-fade-in md:rounded-3xl ${
           size === 'lg' ? 'md:max-w-2xl' : 'md:max-w-md'
         }`}
       >
-        <div className="mx-auto mt-2 h-1.5 w-10 shrink-0 rounded-full bg-slate-300 md:hidden" />
+        <div className="mx-auto mt-2 h-1.5 w-10 shrink-0 rounded-full bg-neutral-300 md:hidden" />
         {title && (
           <div className="flex items-center justify-between px-5 pb-1 pt-3">
-            <h2 className="text-lg font-bold text-slate-900">{title}</h2>
+            <h2 className="text-lg font-bold text-neutral-900">{title}</h2>
             <button
               type="button"
               onClick={onClose}
               aria-label="Close"
-              className="no-print flex h-9 w-9 items-center justify-center rounded-full bg-slate-100 text-slate-600 active:bg-slate-200"
+              className="no-print flex h-9 w-9 items-center justify-center rounded-full bg-neutral-100 text-neutral-600 active:bg-neutral-200"
             >
               ✕
             </button>
