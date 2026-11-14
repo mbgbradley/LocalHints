@@ -1,179 +1,119 @@
 # LocalHints: project context for Claude
 
-LocalHints is a mobile-first website/PWA for hyper-local promotions delivered as **Apple/Google Wallet
-passes**. Shoppers save a pass; the business can change it remotely (upgrade, pause, end, push a message)
-because the pass is linked to the server by a unique ID. Data is still in-browser (no database or payments
-yet), but admin sign-in is a real server-side flow.
+LocalHints is a promotional website: shoppers save hyper-local deals as Apple/Google Wallet passes, businesses
+create and manage the deals, and an admin oversees the platform. It is its own project (unrelated to any other
+codebase). The owner edits files in the GitHub web interface, so the site is **plain static HTML, CSS and
+JavaScript** with no build step and no npm dependencies.
 
-LocalHints is its own project. It is unrelated to any other codebase.
+## Architecture
 
-Stack: Next.js 14 (App Router) · React 18 · TypeScript (strict) · Tailwind CSS 3.4 · Leaflet (map).
-
-## Routes
-
-| URL | Who | Notes |
-|---|---|---|
-| `/` | Shoppers | `ConsumerFeed`: list and map of nearby deals, wallet, profile. No role switcher. |
-| `/business` | Owners | `BusinessAuth` (sign up / sign in) until an account is signed in, then `BusinessDashboard` |
-| `/admin` | Admin | `AdminGate` checks the server session, then `AdminPortal` |
-| `/api/admin/{login,session,logout}` | | Route Handlers, nodejs runtime |
-
-## Run it
-
-```bash
-npm install
-npm run dev        # http://localhost:3000
-npm run typecheck
-npm run build
+```
+docs/                 Static site, served by GitHub Pages (Settings > Pages > main > /docs)
+  index.html          Shopper side:  discover list + map, Main Street Loop, wallet, alerts (PWA)
+  business.html       Merchant side: sign up, Free/Pro, deals, reach, Loop-In, insights, account
+  admin.html          Admin side:    business search + history, activity log, pilot, moderation, settings
+  css/styles.css      All styling (CSS variables, phone first, dashboard layout from 900px)
+  js/config.js        window.LH_CONFIG.API_BASE: "" = demo mode, "https://....workers.dev" = live mode
+  js/engine.js        ALL business rules + the whole HTTP-style API. Single source of truth.
+  js/seed.js          Demo data (all demo logins use password demo1234)
+  js/api.js           Pages call api.get/post. Routes to the in-browser engine (demo) or the Worker (live)
+  js/ui.js            Escaping, dates, sheets, toasts, QR (CDN), Leaflet loader
+  js/consumer.js, business.js, admin.js   One script per page
+  sw.js, manifest.webmanifest, icon*      PWA files
+worker/               Cloudflare Worker: index.js wraps engine.js and stores state in KV (binding LH_KV)
+  worker-single-file.js   GENERATED paste-in copy (engine + seed + index). Regenerate after engine/seed changes.
+  wrangler.toml
+guides/               STEP_BY_STEP.md (beginner), CLOUDFLARE_WORKER.md (settings + API), WALLET_RADIUS_PUSH.md
 ```
 
-Deploy: push to GitHub, import in Vercel, set `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `SESSION_SECRET` (see
-`.env.example`). Defaults are Admin / Admin and show a warning banner; change them before sharing a URL.
-State lives in each browser's `localStorage` (key `localhints:v3`). "Reset demo data" is in the Admin portal.
-Demo business login: see `data/seed.ts` (`DEMO_EMAIL`, `DEMO_PASSWORD`).
+**The key idea:** `engine.js` is one ES module with `handle(ctx, req) -> {status, body}`. In demo mode the
+browser imports it and stores state in `localStorage`. In live mode the Worker imports the same file and stores
+state in KV. Change a rule once, it changes everywhere. Never duplicate business logic in the page scripts;
+pages only render and call the API.
 
-## Folder structure
+State is one JSON document (`emptyState()` in engine.js): businesses, deals, passes, events, loops, drops,
+subscribers, alerts, tips, rate. Logos are separate blobs (`logo:<bizId>`). A KV document is fine for a pilot;
+the upgrade path is D1 or a Durable Object (only the store and load/save in `handle` change).
 
-```text
-types/localhints.ts        Domain types + constants (TIER_LIMITS incl. dropsPerMonth, POINTS, PILOT_*)
-data/seed.ts               buildSeed(now), conciergeDealFor(), demo account, CATEGORY_BENCHMARKS
-lib/geo.ts                 haversine, formatMiles, jitter, browser geolocation, DEFAULT_CENTER
-lib/store.tsx              StoreProvider + useStore(): ALL app state, rules and persistence
-lib/auth.ts                Business password hashing (PBKDF2, WebCrypto), email/password validation
-lib/adminAuth.ts           Server-only: credential check, signed session cookie, rate limit
-lib/wallet.ts              applePassJson(), googleOfferObject(), WALLET_GEOFENCE_METERS
-app/api/admin/*/route.ts   Admin login, session, logout
-components/ui/             Sheet, AppBar, Icon, format.ts
-components/consumer/       ConsumerFeed, DealMap, WalletPassModal, WalletPayloadPreview,
-                           DealSpotterModal, ConsumerProfileDrawer
-components/business/       BusinessAuth, BusinessDashboard, OnboardingWizard, ProCouponBuilder,
-                           WalletPassPreview, CampaignAndBlasts (Neighborhood Drops + Pass Push),
-                           AnalyticsAndBenchmarks, PrintableStandModal
-components/admin/          AdminGate, AdminPortal
-docs/WALLET_RADIUS_PUSH.md How radius drops and wallet passes work (read before building wallet features)
-```
+## Roles and auth
 
-`components/ui/*`, `lib/auth.ts`, `lib/adminAuth.ts`, `lib/wallet.ts` and the admin/business auth components
-are additions to the originally specified tree. `components/demo/RoleSwitcher` was removed.
+- **Shopper:** anonymous. A random `consumerId` is kept in localStorage. No login.
+- **Business:** one account = one business. Email + password (PBKDF2-SHA256, 100k rounds, the Workers max).
+  Bearer token (HMAC-signed, 12h) kept in localStorage. 5 failed logins per 15 min per email+IP.
+- **Admin:** username/password from Worker settings `ADMIN_USERNAME` / `ADMIN_PASSWORD`, default **Admin / Admin**
+  (a red warning shows until both are set). Bearer token (8h) in sessionStorage. 5 failures per 15 min per IP.
+- All user text is escaped with `esc()` before it goes into `innerHTML`. Keep doing this.
 
-## Auth model
+## Business rules (all in engine.js)
 
-- **Admin (real):** `POST /api/admin/login` compares to env vars with `timingSafeEqual`, sets an HMAC-signed
-  HttpOnly, SameSite=Strict cookie `lh_admin` (8h). Rate limit: 5 failures per 15 min per IP (in-memory,
-  best effort; use a shared store in production). `/admin` is noindex.
-- **Business (prototype):** accounts live in the browser store; passwords hashed with PBKDF2-SHA256 via
-  WebCrypto, which needs HTTPS or localhost. One account can own several businesses. Replace with
-  server-side auth (Supabase Auth) when the store moves to a database.
-- **Per-browser data caveat:** a signup on one device is invisible to an admin on another until Supabase.
-
-## State architecture
-
-- `lib/store.tsx` is the ONLY file that knows where data lives. Components call `useStore()` and never
-  touch `localStorage`.
-- One `AppState` object (`types/localhints.ts`, `version: 3`). Actions read the latest state from a ref,
-  validate, then `commit()`. Validated actions return `Result<T>` so the UI can show the error inline.
-- Pure selectors are exported from the store (`isDealLive`, `passStatus`, `isPassUpgraded`,
-  `effectiveTier`, `limitsFor`, `dealsThisMonth`, `savesThisMonth`, `passHolders`, ...). Put new business
-  logic there so a server can reuse it.
-- Pass state is derived, not stored: `passStatus(deal, pass, now)` returns
-  `active | scheduled | paused | complete | expired | voided`. Ending/pausing a deal therefore changes every
-  holder's pass instantly, mirroring a Wallet pass update. Consumer-facing "lock screen" messages are
-  stored in `state.notifications` and shown under Wallet → Wallet updates.
-
-### Swapping in Supabase + Stripe + real Wallet passes
-
-Change only `lib/store.tsx`: replace the action bodies with API calls and load initial state from the
-server. Types map 1:1 to tables (`accounts`, `businesses`, `deals`, `passes`, `spotted_deals`, `pushes`, `drops`). Replace
-`haversineMiles` filtering with PostGIS `ST_DWithin`. `upgradeTier` becomes Stripe Checkout + webhook.
-Real Wallet (see `docs/WALLET_RADIUS_PUSH.md`): sign `.pkpass` / Google Wallet objects server-side; the pass `code`/`referralCode` is the
-server key; `endDeal`, `setDealStatus`, `saveViaReferral` and `sendPassPush` become pass-update pushes.
-
-## Business rules (enforced in the store, mirrored in the UI)
-
-**Plans (`TIER_LIMITS`)**
-
-| | Free Starter | Pro ($29/mo, $290/yr = 2 months free) |
+| | Free Starter | Pro ($29/mo, $290/yr) |
 |---|---|---|
-| Deals | 2 published per calendar month | unlimited |
-| Wallet saves | 50 per calendar month (all deals combined); at the cap, new saves are refused | unlimited |
-| Deal types | % off, $ off | + BOGO (buy X get Y), free item, bundle price |
-| Builder | basics only; 7-day fixed run, QR redemption, default color | all five parameter groups (below) |
-| Pass Push | locked | yes |
-| Neighborhood Drops | locked (0) | 4 per calendar month |
-| Funnel + local benchmarks | locked (blurred) | yes |
+| Published deals | 2 per calendar month | unlimited |
+| Wallet saves | 50 per month across the business | unlimited |
+| Deal types | % off, $ off | + BOGO, free item, bundle |
+| Run length | fixed 7 days from start date | custom end date, up to 90 days |
+| Extras | none (reset by the server even if the form is bypassed) | min spend, claim cap, punch card (3/5/10), pass color, share-to-upgrade |
+| Logo | LocalHints logo on deals | own logo upload (256px PNG, under ~150KB) |
+| Neighborhood Drops / Pass Push | no | 4 drops per month, Pass Push |
+| Full funnel, Neighborhood Benchmarks, Compare past deals | locked (totals only) | yes |
+| Loop-In | can accept, cannot propose | propose + accept |
 
-Drafts do not count toward the deal quota; publishing does.
+- **Pilot:** 5 slots, 60 days of Pro for approved businesses. `effectiveTier()` returns `pro` during a pilot. Always
+  use `effectiveTier` / `limitsFor`, never `biz.tier` directly, for feature checks.
+- **First deal:** every new business gets a "concierge" draft (`makeConcierge`, by category). The owner can **edit**
+  it with the Free options (title, details, % or $ off, value, start date) and publish it once approved.
+- **Statuses:** business `pending | approved | suspended | closed`. Deal `draft | live | paused | suspended | ended`.
+  Admin suspend sets live/paused deals to `suspended` (remembering `suspendedFrom`); reinstate restores them.
+  Closing ends all deals. Admin filter "all deals suspended or paused" ignores drafts and ended deals.
+- **Address check:** `POST /api/address/verify` and signup call Google Geocoding (`GOOGLE_MAPS_API_KEY`). A match must be
+  street level. The business is stored with Google's formatted address, `placeId`, lat/lng and
+  `addressVerified: true`. Without a key, signup still works with a browser location and is flagged "unverified"
+  in Admin. Other businesses at the same `placeId` are flagged "shared address".
+- **Loop-In (Pro):** A proposes (own deal + partner business + reward text), B accepts or declines (free). When a
+  customer's first redemption of A's deal happens, a `loop` pass for B's reward is created (valid 14 days) and the
+  shopper is alerted. B redeems it by code. One active/pending Loop-In per deal.
+- **Share-to-upgrade:** pass `referralCode`; a friend who saves through `?deal=ID&ref=CODE` bumps `friendSaves`;
+  enough friends upgrades the label and sends an alert.
+- **Drops:** radius 0.5 to 5 miles from the business to opted-in shoppers' rounded (about 1 km) location. They
+  receive an in-app alert, then add the pass (Apple/Google never allow silent insertion).
+- **Redeem:** by pass code (QR content is `LH-<code>`). Min-spend deals ask the owner to confirm. Stamps add up.
+- **Activity log:** every business action writes an event (`EVENT_LABELS` in engine.js): signup, approved,
+  suspended, reinstated, closed, reopened, login, deal created/published/edited/status, plan changed, upgrade
+  requested, pilot started/ended, Loop-In events, drop, push, redeem, profile, logo. Admin shows signup date,
+  approval date, last login, closed date and the full timeline per business.
 
-**Pilot:** `PILOT_SLOTS` = 5 businesses get Pro features free for `PILOT_DAYS` = 60 (`pilotEndsAt`).
-`effectiveTier()` returns `pro` while the pilot is active, then falls back to `tier`. Admin enrolls/ends
-pilots. Always use `limitsFor(biz, now)` instead of reading `biz.tier` directly.
+### Why a business logs in (use these to guide features)
 
-**Pro Coupon Builder, 5 groups:** (1) Offer structure: discount type, minimum spend, single-use vs
-3/5/10-visit stamp card. (2) Viral & loop: share-to-upgrade (base value → upgraded value after 1/2/3
-friend saves; percent/$ deals only, upgraded must exceed base), Main Street Loop partner (an approved,
-different-category neighbor). (3) Time & scarcity: fixed date (≤90 days), rolling timer (hours after
-saving), weekly recurring window (days + hours, "slow-hours recycling"), first-N quantity cap.
-(4) Branding: hex brand color tints the whole card; logo is the business emoji (no image upload yet).
-(5) Redemption: dynamic QR, POS promo code, or cashier tap; per-customer limit (once/weekly/unlimited).
-Free tier gets these reset to defaults by `createDeal` even if the UI is bypassed.
+Check how a deal is doing; redeem a customer's pass at the counter; edit or publish the suggested first deal;
+create a new deal for a slow day; pause, resume or end a deal; answer a Loop-In request from a neighbor; send a
+Neighborhood Drop or Pass Push; read the funnel, benchmarks and past-deal comparison; upgrade, downgrade or
+see the pilot end date; update hours/address/logo; see why they were suspended or when they were approved;
+close the account.
 
-**Share-to-upgrade:** each pass has a `referralCode` (link `localhints.com/p/<code>`). When a friend saves
-through it (`saveViaReferral`), the source pass's `friendSaves` increments. Once `friendSaves >=
-friendsNeeded`, `isPassUpgraded` is true: the pass shows the upgraded label, the QR value changes, and a
-"Your friend saved the deal! … upgraded to 25% OFF" wallet update is queued. Friend saves count toward the
-business's monthly save cap. The consumer UI has a "pretend a friend just saved it" demo button.
+## Settings (Worker, not committed)
 
-**Remote control:** `setDealStatus` pauses/resumes (passes show "Paused by merchant", resume reactivates
-existing passes). `endDeal` voids permanently ("Offer ended by merchant", pass moves to Expired Passes).
-Recurring deals are hidden from "Nearby" outside their window and shown under "Opens soon".
+`ADMIN_USERNAME`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `ALLOWED_ORIGIN`, `GOOGLE_MAPS_API_KEY`,
+`GOOGLE_WALLET_ISSUER_ID`, `GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL`, `GOOGLE_WALLET_PRIVATE_KEY`, `ALLOW_SELF_UPGRADE`
+(testing only). Details in `guides/CLOUDFLARE_WORKER.md`. Never commit secrets.
 
-**Redemption:** the business enters the pass code (Overview → Redeem a pass) or, for `tap` deals, the
-consumer taps in their wallet. Stamp cards add one stamp per redemption and complete at N. Single-use
-`once` passes complete on first redemption; `weekly` blocks a second redemption within 7 days. Expired,
-paused, voided, out-of-window and completed passes cannot be redeemed.
+## Known shortcuts (not bugs)
 
-**Pass Push (Pro):** 10 to 100 chars, delivered to every holder of an active/scheduled/paused pass. Free to
-deliver (Wallet update, not SMS). The demo consumer sees it under Wallet updates if they hold a pass.
-
-**Onboarding:** registering creates a `pending` Free business plus a "concierge" draft deal
-(`conciergeDealFor`, templated by category). The owner previews it on Overview and taps "Approve & go
-live" (needs admin approval first). Admin approves/suspends businesses; pending or suspended businesses
-cannot publish and their deals are hidden.
-
-**Analytics:** funnel is Views → Wallet saves → Friend shares → Redemptions (a pass counts as redeemed
-once `stamps > 0`). Benchmarks compare against static `CATEGORY_BENCHMARKS`. Revenue is an estimate from
-`AVG_TICKET`.
-
-**Points:** claim +5, redeem +20, approved community tip +25 (demo consumer's own tips only).
-**Community tips ("Spot a deal"):** submitted `pending`, admin approves/rejects, approved tips show as
-"Spotted by neighbors" and cannot be claimed.
-
-**Neighborhood Drop (Pro):** a radius alert (0.5 to 5 mi from the business) about one live deal; message 10 to
-100 chars; needs an approved business. `estimateDropReach` simulates the audience. The demo shopper receives
-it only if `notifyNearby` is on and they are within the radius. A drop alerts people; they still tap to add
-the pass to their wallet (platforms forbid silent insertion). Details in `docs/WALLET_RADIUS_PUSH.md`.
-
-## Known prototype shortcuts (not bugs)
-
-- The QR is a decorative deterministic pattern, not scannable. Replace `QrPattern` with a real QR lib.
-- Apple/Google Wallet buttons show the generated payload (`WalletPayloadPreview`); passes are unsigned and
-  nothing is added to a real wallet. Real passes need Apple/Google accounts, signing keys and a server.
-- Pass Push, Neighborhood Drops and wallet notifications are simulated in-app; nothing reaches devices.
-- Stripe checkout, hero photo upload and the Counter Stand PDF are stand-ins (the stand uses the browser
-  print dialog).
-- Concierge drafts come from category templates. Addresses are not geocoded (the signup uses a location
-  button or a spot in the demo district).
-- Map tiles (CARTO Positron) need internet. "Use my location" can empty the feed because sample shops are in
-  a fictional district; "Demo district" resets it.
-- No service worker yet (installable, not offline). The code was written without running `npm install` or a
-  build in the authoring environment: run `npm run typecheck && npm run build` first.
+- Apple Wallet: pass data is generated but there is no signed `.pkpass` yet. Google Wallet works once the three
+  `GOOGLE_WALLET_*` settings exist (a signed Save link; the engine's JWT signing was tested with a generated key
+  but not against Google's servers).
+- Alerts (drops, pushes) are in-app only. Real web push, SMS and email are not built.
+- Billing is not connected. On live, "Upgrade to Pro" becomes an `upgrade_requested` event for the admin; in demo
+  mode it switches instantly.
+- Single KV document (see above). Rate limits and events live in it too.
+- QR codes and map tiles load from CDNs (qrcode-generator on cdnjs, Leaflet on unpkg, CARTO tiles); offline they
+  fall back to showing the code / a message. No Subresource Integrity hashes yet.
+- No camera scanning for redemption (type the code).
 
 ## Conventions
 
-- Mobile-first at 390px. Consumer view is a `max-w-[430px]` column with sticky bottom nav and bottom
-  sheets; Business/Admin use `max-w-7xl` multi-column layouts from `lg` up.
-- Tailwind only (neutral palette plus brand color `hint-*`). Use complete class strings. Per-deal brand colors are applied
-  with inline `style` (arbitrary hex values cannot be Tailwind classes).
-- Printing: only `.print-area` prints; add `no-print` to controls.
-- Types in `types/localhints.ts`, seed in `data/seed.ts`, rules in the store; components stay
-  presentational plus local form state. Never leave TODO stubs.
+- No build tools, no frameworks, no npm packages. ES modules, `async/await`, template strings.
+- Phone first at 390px; dashboards use wider layouts from 900px. Dark mode follows the system.
+- After changing `engine.js` or `seed.js`, regenerate `worker/worker-single-file.js` (concatenate engine + seed +
+  index, strip imports/exports) and bump `CACHE` in `docs/sw.js` when site files change.
+- Test: the engine runs in plain Node (`import { handle } from './docs/js/engine.js'`) with an in-memory store.
+- Never leave TODO stubs.

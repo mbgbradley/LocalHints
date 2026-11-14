@@ -1,0 +1,1658 @@
+/*
+ * LocalHints Worker: SINGLE-FILE VERSION (generated). Paste this whole file into the Cloudflare dashboard editor.
+ * It is docs/js/engine.js + docs/js/seed.js + worker/index.js joined together. Do not edit it by hand:
+ * change the real files, then ask Claude to regenerate this one.
+ * Needs a KV binding named LH_KV. See guides/STEP_BY_STEP.md.
+ */
+
+// ===== engine.js =====
+/*
+ * LocalHints engine: ALL business rules and the whole HTTP-style API live in this one file.
+ *
+ * The same file runs in two places:
+ *   1. Cloudflare Worker (live mode)  -> worker/index.js imports it. Data lives in Cloudflare KV.
+ *   2. The browser (demo mode)        -> js/api.js imports it. Data lives in localStorage.
+ *
+ * It has no dependencies. It uses only Web standards (fetch, WebCrypto, TextEncoder) that both
+ * places provide. Change a rule here and both modes change together.
+ *
+ * Entry point: handle(ctx, req) -> { status, body }
+ *   ctx = { store, env, fetch, demo, origin, seed?, autoSeed? }
+ *   req = { method, path, query, body, headers, ip }
+ */
+
+// ---------------------------------------------------------------- constants
+
+const DAY = 864e5;
+const HOUR = 36e5;
+const UNLIMITED = 1e9;
+
+const CATEGORIES = [
+  { id: 'food', label: 'Food & Drink', emoji: '🍕' },
+  { id: 'cafe', label: 'Coffee & Bakery', emoji: '☕' },
+  { id: 'dessert', label: 'Dessert', emoji: '🍦' },
+  { id: 'retail', label: 'Shopping', emoji: '🛍️' },
+  { id: 'beauty', label: 'Beauty & Wellness', emoji: '✂️' },
+  { id: 'fitness', label: 'Fitness', emoji: '💪' },
+  { id: 'services', label: 'Services', emoji: '🛠️' },
+  { id: 'fun', label: 'Entertainment', emoji: '🎬' },
+];
+const CAT_IDS = CATEGORIES.map((c) => c.id);
+
+const LIMITS = {
+  free: { dealsPerMonth: 2, savesPerMonth: 50, dropsPerMonth: 0 },
+  pro: { dealsPerMonth: UNLIMITED, savesPerMonth: UNLIMITED, dropsPerMonth: 4 },
+};
+const PILOT = { slots: 5, days: 60 };
+const PRICE = { monthly: 29, yearly: 290 };
+const DEAL_TYPES = ['percent', 'amount', 'bogo', 'freeitem', 'bundle'];
+const FREE_DEAL_TYPES = ['percent', 'amount'];
+const DEMO_CENTER = { lat: 40.744, lng: -73.9903 };
+
+const AVG_TICKET = { food: 18, cafe: 9, dessert: 7, retail: 35, beauty: 45, fitness: 30, services: 60, fun: 20 };
+const BENCH = {
+  food: { saveRate: 0.2, redeemRate: 0.35 },
+  cafe: { saveRate: 0.24, redeemRate: 0.42 },
+  dessert: { saveRate: 0.22, redeemRate: 0.4 },
+  retail: { saveRate: 0.15, redeemRate: 0.25 },
+  beauty: { saveRate: 0.12, redeemRate: 0.3 },
+  fitness: { saveRate: 0.1, redeemRate: 0.22 },
+  services: { saveRate: 0.1, redeemRate: 0.28 },
+  fun: { saveRate: 0.18, redeemRate: 0.3 },
+};
+
+const EVENT_LABELS = {
+  signup: 'Signed up',
+  approved: 'Approved by admin',
+  suspended: 'Suspended by admin',
+  reinstated: 'Reinstated by admin',
+  closed: 'Account closed',
+  reopened: 'Account reopened',
+  login: 'Logged in',
+  deal_created: 'New deal created',
+  deal_published: 'Deal published',
+  deal_edited: 'Deal edited',
+  deal_status: 'Deal status changed',
+  deal_deleted: 'Draft deleted',
+  tier_changed: 'Plan changed',
+  upgrade_requested: 'Asked to upgrade to Pro',
+  pilot_started: 'Pilot started',
+  pilot_ended: 'Pilot ended',
+  loop_proposed: 'Loop-In proposed',
+  loop_accepted: 'Loop-In accepted',
+  loop_declined: 'Loop-In declined',
+  loop_ended: 'Loop-In ended',
+  drop_sent: 'Neighborhood Drop sent',
+  push_sent: 'Pass Push sent',
+  redeem: 'Redeemed a pass',
+  profile_updated: 'Profile updated',
+  logo_updated: 'Logo updated',
+};
+
+// ---------------------------------------------------------------- small helpers
+
+const enc = new TextEncoder();
+const ok = (body, status = 200) => ({ status, body });
+const err = (message, status = 400, extra) => ({ status, body: { error: message, ...(extra || {}) } });
+
+function rand(n = 10) {
+  const bytes = crypto.getRandomValues(new Uint8Array(n));
+  return [...bytes].map((b) => (b % 36).toString(36)).join('');
+}
+const uid = (p) => p + rand(10);
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function makeCode(n = 6) {
+  const bytes = crypto.getRandomValues(new Uint8Array(n));
+  return [...bytes].map((b) => CODE_CHARS[b % CODE_CHARS.length]).join('');
+}
+const monthKey = (ms) => {
+  const d = new Date(ms);
+  return d.getUTCFullYear() * 12 + d.getUTCMonth();
+};
+const sameMonth = (a, b) => monthKey(a) === monthKey(b);
+const clean = (s, max) => String(s ?? '').replace(/[\u0000-\u001f<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+const isNum = (n) => typeof n === 'number' && Number.isFinite(n);
+
+function haversineMiles(a, b) {
+  const R = 3958.8;
+  const rad = (x) => (x * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat);
+  const dLng = rad(b.lng - a.lng);
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function emptyState() {
+  return {
+    v: 1,
+    businesses: [],
+    deals: [],
+    passes: [],
+    events: [],
+    loops: [],
+    drops: [],
+    subscribers: [],
+    alerts: [],
+    tips: [],
+    rate: {},
+    secret: null,
+  };
+}
+
+// ---------------------------------------------------------------- crypto (passwords, tokens)
+
+function toB64u(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function fromB64u(str) {
+  const b = atob(str.replace(/-/g, '+').replace(/_/g, '/'));
+  const out = new Uint8Array(b.length);
+  for (let i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
+  return out;
+}
+async function hmac(secret, data) {
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return toB64u(await crypto.subtle.sign('HMAC', key, enc.encode(data)));
+}
+function safeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+async function signToken(secret, payload) {
+  const body = toB64u(enc.encode(JSON.stringify(payload)));
+  return body + '.' + (await hmac(secret, body));
+}
+async function readToken(secret, token, now) {
+  if (!token || typeof token !== 'string' || !token.includes('.')) return null;
+  const [body, sig] = token.split('.');
+  if (!safeEqual(sig, await hmac(secret, body))) return null;
+  try {
+    const p = JSON.parse(new TextDecoder().decode(fromB64u(body)));
+    return p.exp > now ? p : null;
+  } catch {
+    return null;
+  }
+}
+// Cloudflare Workers allow at most 100,000 PBKDF2 iterations.
+const PBKDF2_ITERATIONS = 100000;
+async function hashPassword(password, saltB64) {
+  const salt = saltB64 ? fromB64u(saltB64) : crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: PBKDF2_ITERATIONS }, key, 256);
+  return { salt: toB64u(salt), hash: toB64u(bits) };
+}
+async function sha256(s) {
+  return toB64u(await crypto.subtle.digest('SHA-256', enc.encode(s)));
+}
+
+function validEmail(e) {
+  return typeof e === 'string' && e.length <= 120 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
+}
+function passwordProblem(p) {
+  if (typeof p !== 'string' || p.length < 8) return 'Password must be at least 8 characters.';
+  if (!/[A-Za-z]/.test(p) || !/[0-9]/.test(p)) return 'Password needs at least one letter and one number.';
+  if (p.length > 100) return 'Password is too long.';
+  return null;
+}
+
+// ---------------------------------------------------------------- rate limiting (stored in state)
+
+function limited(state, key, now) {
+  const r = state.rate[key];
+  return !!(r && r.until > now);
+}
+function failure(state, key, now, max = 5, windowMs = 15 * 60 * 1000) {
+  const r = state.rate[key] && state.rate[key].reset > now ? state.rate[key] : { n: 0, reset: now + windowMs, until: 0 };
+  r.n += 1;
+  if (r.n >= max) r.until = now + windowMs;
+  state.rate[key] = r;
+}
+function clearFailures(state, key) {
+  delete state.rate[key];
+}
+function pruneRate(state, now) {
+  for (const k of Object.keys(state.rate)) if (state.rate[k].reset < now && state.rate[k].until < now) delete state.rate[k];
+}
+function hit(state, key, now, max, windowMs) {
+  // counts every call (not only failures); returns true when over the limit
+  const r = state.rate[key] && state.rate[key].reset > now ? state.rate[key] : { n: 0, reset: now + windowMs, until: 0 };
+  r.n += 1;
+  state.rate[key] = r;
+  return r.n > max;
+}
+
+// ---------------------------------------------------------------- domain helpers
+
+function effectiveTier(b, now) {
+  return b.pilotEndsAt && b.pilotEndsAt > now ? 'pro' : b.tier;
+}
+function isPilot(b, now) {
+  return !!(b.pilotEndsAt && b.pilotEndsAt > now);
+}
+function limitsFor(b, now) {
+  return LIMITS[effectiveTier(b, now)];
+}
+function dealLabel(d, upgraded) {
+  const v = upgraded && d.upgrade ? d.upgrade.upgradedValue : d.value;
+  if (d.type === 'percent') return `${v}% OFF`;
+  if (d.type === 'amount') return `$${v} OFF`;
+  if (d.type === 'bogo') return 'BUY 1 GET 1';
+  if (d.type === 'freeitem') return 'FREE ITEM';
+  return `$${d.value} BUNDLE`;
+}
+function isLive(d, b, now) {
+  return d.status === 'live' && b.status === 'approved' && d.startsAt <= now && now < d.endsAt;
+}
+function passStatus(p, d, b, now) {
+  if (b.status === 'suspended' || b.status === 'closed') return 'suspended';
+  if (p.kind === 'loop') {
+    if (p.stamps >= 1) return 'complete';
+    return now > p.expiresAt ? 'expired' : 'active';
+  }
+  if (!d) return 'ended';
+  if (d.status === 'suspended') return 'suspended';
+  if (d.status === 'ended') return 'ended';
+  if (d.status === 'paused') return 'paused';
+  if (p.stamps >= d.stamps) return 'complete';
+  if (now >= d.endsAt) return 'expired';
+  if (now < d.startsAt) return 'scheduled';
+  return 'active';
+}
+const upgradedPass = (d, p) => !!(d && d.upgrade && p.friendSaves >= d.upgrade.friendsNeeded);
+
+const getBiz = (s, id) => s.businesses.find((b) => b.id === id);
+const getDeal = (s, id) => s.deals.find((d) => d.id === id);
+
+function log(state, ctx, bizId, type, detail) {
+  state.events.push({ id: uid('e'), bizId, type, detail: detail || '', at: ctx.now });
+  if (state.events.length > 5000) state.events.splice(0, state.events.length - 5000);
+}
+function alertTo(state, ctx, consumerId, kind, title, body, extra) {
+  state.alerts.push({ id: uid('a'), consumerId, kind, title, body, at: ctx.now, ...(extra || {}) });
+  if (state.alerts.length > 20000) state.alerts.splice(0, state.alerts.length - 20000);
+}
+
+const CONCIERGE = {
+  food: { title: '15% off your meal', description: 'Show this pass at the counter for 15% off your order.', type: 'percent', value: 15 },
+  cafe: { title: '$2 off any drink', description: 'Treat yourself. $2 off any handcrafted drink.', type: 'amount', value: 2 },
+  dessert: { title: '10% off any treat', description: 'Something sweet for less. Show this pass at checkout.', type: 'percent', value: 10 },
+  retail: { title: '15% off one item', description: 'Take 15% off one full-price item.', type: 'percent', value: 15 },
+  beauty: { title: '$10 off your visit', description: 'Welcome in. $10 off any service.', type: 'amount', value: 10 },
+  fitness: { title: '$10 off your first class', description: 'Try us out. $10 off your first class or day pass.', type: 'amount', value: 10 },
+  services: { title: '10% off your first service', description: 'New neighbors get 10% off their first service.', type: 'percent', value: 10 },
+  fun: { title: '$3 off admission', description: 'Enjoy $3 off admission for one guest.', type: 'amount', value: 3 },
+};
+
+function makeConcierge(b, now) {
+  const t = CONCIERGE[b.category] || CONCIERGE.food;
+  return {
+    id: uid('d'), bizId: b.id, ...t,
+    itemText: '', minSpend: 0, status: 'draft', isConcierge: true,
+    startsAt: now, endsAt: now + 7 * DAY, createdAt: now, publishedAt: 0,
+    claimCap: 0, stamps: 1, color: '#0d9488', upgrade: null, views: 0,
+  };
+}
+
+// ---------------------------------------------------------------- deal validation
+
+function normalizeDeal(biz, inp, now, existing) {
+  const pro = effectiveTier(biz, now) === 'pro';
+  const pick = (k, dflt) => (inp[k] !== undefined ? inp[k] : existing ? existing[k] : dflt);
+
+  const title = clean(pick('title', ''), 60);
+  if (title.length < 3) return { error: 'Give the deal a title (3 to 60 characters).' };
+  const description = clean(pick('description', ''), 240);
+  const type = pick('type', 'percent');
+  if (!DEAL_TYPES.includes(type)) return { error: 'Unknown deal type.' };
+  if (!pro && !FREE_DEAL_TYPES.includes(type)) {
+    return { error: 'The Free plan supports % off and $ off deals. Upgrade to Pro for buy-one-get-one, free item and bundle deals.', upgrade: true };
+  }
+
+  let value = Number(pick('value', 0));
+  let itemText = '';
+  if (type === 'percent') {
+    if (!Number.isInteger(value) || value < 1 || value > 90) return { error: 'Percent off must be a whole number from 1 to 90.' };
+  } else if (type === 'amount' || type === 'bundle') {
+    if (!isNum(value) || value < 1 || value > 500) return { error: 'Dollar amount must be between 1 and 500.' };
+    value = Math.round(value * 100) / 100;
+  } else value = 0;
+  if (type === 'bogo' || type === 'freeitem' || type === 'bundle') {
+    itemText = clean(pick('itemText', ''), 80);
+    if (itemText.length < 3) return { error: 'Say what the customer gets (3 to 80 characters).' };
+  }
+
+  // start / end. A deal that has already started keeps its start; otherwise it starts now or later (max 60 days ahead).
+  const isStarted = !!(existing && existing.status !== 'draft' && existing.startsAt <= now);
+  let startsAt = existing && isStarted ? existing.startsAt : inp.startsAt !== undefined ? Number(inp.startsAt) : now;
+  if (!isNum(startsAt)) startsAt = now;
+  if (!isStarted) startsAt = Math.min(Math.max(startsAt, now), now + 60 * DAY);
+  let endsAt = startsAt + 7 * DAY;
+  if (pro) {
+    const keep = isStarted && existing ? existing.endsAt : endsAt;
+    const wanted = Number(inp.endsAt !== undefined ? inp.endsAt : keep);
+    if (isNum(wanted)) endsAt = wanted;
+    if (endsAt < startsAt + HOUR) return { error: 'The deal must run for at least one hour.' };
+    if (endsAt > startsAt + 90 * DAY) return { error: 'Deals can run for at most 90 days.' };
+  } else if (isStarted && existing) endsAt = existing.endsAt;
+
+  // Pro-only extras. On Free they are reset, even if someone bypasses the form.
+  let minSpend = 0, claimCap = 0, stamps = 1, color = '#0d9488', upgrade = null;
+  if (pro) {
+    minSpend = Number(pick('minSpend', 0)) || 0;
+    if (minSpend < 0 || minSpend > 500) return { error: 'Minimum spend must be between 0 and 500.' };
+    claimCap = Math.floor(Number(pick('claimCap', 0)) || 0);
+    if (claimCap < 0 || claimCap > 100000) return { error: 'Claim limit must be between 1 and 100000 (or empty for no limit).' };
+    stamps = Math.floor(Number(pick('stamps', 1)) || 1);
+    if (![1, 3, 5, 10].includes(stamps)) return { error: 'Punch cards can have 1, 3, 5 or 10 stamps.' };
+    color = String(pick('color', '#0d9488'));
+    if (!/^#[0-9a-fA-F]{6}$/.test(color)) return { error: 'Brand color must look like #0d9488.' };
+    const up = pick('upgrade', null);
+    if (up && up.friendsNeeded) {
+      if (type !== 'percent' && type !== 'amount') return { error: 'Share-to-upgrade works with % off and $ off deals.' };
+      const fn = Math.floor(Number(up.friendsNeeded));
+      const uv = Number(up.upgradedValue);
+      if (![1, 2, 3].includes(fn)) return { error: 'Friends needed must be 1, 2 or 3.' };
+      if (!isNum(uv) || uv <= value || (type === 'percent' && uv > 90) || (type === 'amount' && uv > 500)) {
+        return { error: 'The upgraded offer must be bigger than the starting offer.' };
+      }
+      upgrade = { friendsNeeded: fn, upgradedValue: uv };
+    }
+  }
+  return { fields: { title, description, type, value, itemText, minSpend, startsAt, endsAt, claimCap, stamps, color, upgrade } };
+}
+
+// ---------------------------------------------------------------- address verification (Google Geocoding)
+
+async function geocode(ctx, address) {
+  const key = ctx.env && ctx.env.GOOGLE_MAPS_API_KEY;
+  if (!key || !ctx.fetch) return { unavailable: true, reason: 'not_configured' };
+  let data;
+  try {
+    const url =
+      'https://maps.googleapis.com/maps/api/geocode/json?address=' + encodeURIComponent(address) +
+      (ctx.env.GOOGLE_REGION ? '&region=' + encodeURIComponent(ctx.env.GOOGLE_REGION) : '') + '&key=' + encodeURIComponent(key);
+    data = await (await ctx.fetch(url)).json();
+  } catch {
+    return { unavailable: true, reason: 'network' };
+  }
+  if (data.status === 'ZERO_RESULTS') return { ok: false, error: 'We could not find that address. Check the street, city and state.' };
+  if (data.status !== 'OK' || !data.results || !data.results[0]) return { unavailable: true, reason: data.status || 'error' };
+  const r = data.results[0];
+  const streetLevel = (r.types || []).some((t) => ['street_address', 'premise', 'subpremise', 'establishment', 'point_of_interest'].includes(t));
+  if (!streetLevel) return { ok: false, error: 'That looks like a general area, not a street address. Add the street number and name.', formatted: r.formatted_address };
+  return {
+    ok: true,
+    formatted: r.formatted_address,
+    lat: r.geometry.location.lat,
+    lng: r.geometry.location.lng,
+    placeId: r.place_id,
+    partial: !!r.partial_match,
+  };
+}
+
+// ---------------------------------------------------------------- public views
+
+function logoShown(b, now) {
+  return !!b.logoV && effectiveTier(b, now) === 'pro';
+}
+function bizPublic(b, now) {
+  return { id: b.id, name: b.name, category: b.category, emoji: b.emoji, address: b.address, lat: b.lat, lng: b.lng, blurb: b.blurb, hasLogo: logoShown(b, now), logoV: b.logoV };
+}
+function loopFor(state, d, now) {
+  const l = state.loops.find((x) => x.fromDealId === d.id && x.status === 'active');
+  if (!l) return null;
+  const partner = getBiz(state, l.toBizId);
+  if (!partner || partner.status !== 'approved') return null;
+  return { id: l.id, rewardText: l.rewardText, partner: bizPublic(partner, now) };
+}
+function dealPublic(state, d, now, extra) {
+  const b = getBiz(state, d.bizId);
+  const saves = state.passes.filter((p) => p.dealId === d.id).length;
+  return {
+    id: d.id, title: d.title, description: d.description, type: d.type, value: d.value, itemText: d.itemText,
+    minSpend: d.minSpend, startsAt: d.startsAt, endsAt: d.endsAt, status: d.status, label: dealLabel(d),
+    stamps: d.stamps, color: d.color, upgrade: d.upgrade, claimCap: d.claimCap,
+    spotsLeft: d.claimCap ? Math.max(0, d.claimCap - saves) : null,
+    biz: bizPublic(b, now), loop: loopFor(state, d, now), ...(extra || {}),
+  };
+}
+function passPublic(state, p, now) {
+  const d = p.dealId ? getDeal(state, p.dealId) : null;
+  const b = getBiz(state, p.bizId);
+  const up = upgradedPass(d, p);
+  let loop = null;
+  if (p.kind === 'loop') {
+    const l = state.loops.find((x) => x.id === p.loopId);
+    const src = l && getBiz(state, l.fromBizId);
+    loop = { rewardText: p.rewardText, from: src ? bizPublic(src, now) : null };
+  }
+  return {
+    id: p.id, code: p.code, kind: p.kind, status: passStatus(p, d, b, now), stamps: p.stamps,
+    stampsNeeded: p.kind === 'loop' ? 1 : d ? d.stamps : 1, createdAt: p.createdAt, expiresAt: p.expiresAt || (d ? d.endsAt : 0),
+    referralCode: p.referralCode, friendSaves: p.friendSaves, upgraded: up,
+    label: d ? dealLabel(d, up) : p.rewardText, loop,
+    deal: d ? dealPublic(state, d, now) : null, biz: bizPublic(b, now),
+  };
+}
+
+function usage(state, b, now) {
+  return {
+    dealsPublished: state.deals.filter((d) => d.bizId === b.id && d.publishedAt && sameMonth(d.publishedAt, now)).length,
+    saves: state.passes.filter((p) => p.bizId === b.id && p.kind === 'deal' && sameMonth(p.createdAt, now)).length,
+    drops: state.drops.filter((x) => x.bizId === b.id && sameMonth(x.at, now)).length,
+  };
+}
+function dealMetrics(state, d) {
+  const passes = state.passes.filter((p) => p.dealId === d.id && p.kind === 'deal');
+  const saves = passes.length;
+  const redemptions = passes.filter((p) => p.stamps > 0).length;
+  const shares = passes.reduce((n, p) => n + p.friendSaves, 0);
+  return { views: d.views || 0, saves, shares, redemptions };
+}
+function ownerDeal(state, d, now) {
+  const b = getBiz(state, d.bizId);
+  return { ...dealPublic(state, d, now), isConcierge: !!d.isConcierge, publishedAt: d.publishedAt, createdAt: d.createdAt, suspendedFrom: d.suspendedFrom || null, live: isLive(d, b, now), metrics: dealMetrics(state, d) };
+}
+function bizPrivate(state, b, now) {
+  return {
+    id: b.id, email: b.email, ownerName: b.ownerName, name: b.name, category: b.category, emoji: b.emoji,
+    address: b.address, addressVerified: b.addressVerified, lat: b.lat, lng: b.lng, blurb: b.blurb,
+    tier: b.tier, effectiveTier: effectiveTier(b, now), pilotEndsAt: b.pilotEndsAt, status: b.status,
+    signedUpAt: b.signedUpAt, approvedAt: b.approvedAt, lastLoginAt: b.lastLoginAt, closedAt: b.closedAt,
+    hasLogo: !!b.logoV, logoV: b.logoV, logoShown: logoShown(b, now),
+    limits: limitsFor(b, now), usage: usage(state, b, now),
+  };
+}
+
+// ---------------------------------------------------------------- wallet payloads
+
+function pemToBuf(pem) {
+  const b = atob(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''));
+  const out = new Uint8Array(b.length);
+  for (let i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
+  return out.buffer;
+}
+async function signRS256(pem, data) {
+  const key = await crypto.subtle.importKey('pkcs8', pemToBuf(pem), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+  return toB64u(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, enc.encode(data)));
+}
+async function walletPayloads(ctx, state, p, now) {
+  const d = p.dealId ? getDeal(state, p.dealId) : null;
+  const b = getBiz(state, p.bizId);
+  const status = passStatus(p, d, b, now);
+  const up = upgradedPass(d, p);
+  const label = d ? dealLabel(d, up) : p.rewardText;
+  const title = d ? d.title : 'Loop reward';
+  const color = d ? d.color : '#0d9488';
+  const expires = p.expiresAt || (d ? d.endsAt : now + 14 * DAY);
+  const voided = ['suspended', 'ended', 'expired', 'complete'].includes(status);
+  const env = ctx.env || {};
+  const barcode = 'LH-' + p.code;
+
+  const apple = {
+    formatVersion: 1,
+    passTypeIdentifier: env.APPLE_PASS_TYPE_ID || 'pass.com.localhints.offer',
+    teamIdentifier: env.APPLE_TEAM_ID || 'TEAMID0000',
+    serialNumber: p.id,
+    organizationName: 'LocalHints',
+    description: `${title} at ${b.name}`,
+    logoText: b.name,
+    foregroundColor: 'rgb(255,255,255)',
+    backgroundColor: color,
+    labelColor: 'rgb(230,255,250)',
+    barcodes: [{ format: 'PKBarcodeFormatQR', message: barcode, messageEncoding: 'iso-8859-1', altText: p.code }],
+    locations: [{ latitude: b.lat, longitude: b.lng, relevantText: `${b.name} is nearby: ${label}` }],
+    maxDistance: 300,
+    expirationDate: new Date(expires).toISOString(),
+    voided,
+    coupon: {
+      primaryFields: [{ key: 'offer', label: b.name.toUpperCase(), value: label, changeMessage: 'Your offer changed to %@' }],
+      secondaryFields: [{ key: 'deal', label: 'DEAL', value: title }],
+      auxiliaryFields: [
+        { key: 'stamps', label: 'STAMPS', value: `${p.stamps} / ${d ? d.stamps : 1}`, changeMessage: 'Stamp card: %@' },
+        { key: 'ends', label: 'ENDS', value: new Date(expires).toISOString().slice(0, 10), dateStyle: 'PKDateStyleShort' },
+      ],
+      backFields: [
+        { key: 'where', label: 'Where', value: b.address },
+        { key: 'code', label: 'Pass code', value: p.code },
+      ],
+    },
+  };
+  if (env.APPLE_WEB_SERVICE_URL) {
+    apple.webServiceURL = env.APPLE_WEB_SERVICE_URL;
+    apple.authenticationToken = (await hmac(ctx.secret, 'apple:' + p.id)).slice(0, 32);
+  }
+
+  const issuer = env.GOOGLE_WALLET_ISSUER_ID || '0000000000000000000';
+  const classId = `${issuer}.localhints_offer`;
+  const googleClass = { id: classId, issuerName: 'LocalHints', provider: 'LocalHints', title: 'LocalHints deal', redemptionChannel: 'INSTORE', reviewStatus: 'UNDER_REVIEW' };
+  const googleObject = {
+    id: `${issuer}.${p.id}`,
+    classId,
+    state: voided ? 'INACTIVE' : 'ACTIVE',
+    barcode: { type: 'QR_CODE', value: barcode, alternateText: p.code },
+    validTimeInterval: { start: { date: new Date(d ? d.startsAt : p.createdAt).toISOString() }, end: { date: new Date(expires).toISOString() } },
+    locations: [{ latitude: b.lat, longitude: b.lng }],
+    textModulesData: [
+      { header: b.name, body: `${title}: ${label}`, id: 'offer' },
+      { header: 'Stamps', body: `${p.stamps} / ${d ? d.stamps : 1}`, id: 'stamps' },
+      { header: 'Where', body: b.address, id: 'where' },
+    ],
+  };
+  let saveUrl = null;
+  if (env.GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL && env.GOOGLE_WALLET_PRIVATE_KEY && env.GOOGLE_WALLET_ISSUER_ID) {
+    const header = toB64u(enc.encode(JSON.stringify({ alg: 'RS256', typ: 'JWT' })));
+    const claims = toB64u(enc.encode(JSON.stringify({
+      iss: env.GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL, aud: 'google', typ: 'savetowallet',
+      iat: Math.floor(now / 1000), origins: ctx.origin ? [ctx.origin] : [],
+      payload: { offerClasses: [googleClass], offerObjects: [googleObject] },
+    })));
+    const sig = await signRS256(env.GOOGLE_WALLET_PRIVATE_KEY.replace(/\\n/g, '\n'), `${header}.${claims}`);
+    saveUrl = `https://pay.google.com/gp/v/save/${header}.${claims}.${sig}`;
+  }
+  return { apple, google: { class: googleClass, object: googleObject, saveUrl }, appleSigned: false };
+}
+
+// ---------------------------------------------------------------- routing
+
+function match(pattern, path) {
+  const a = pattern.split('/');
+  const b = path.split('/');
+  if (a.length !== b.length) return null;
+  const params = {};
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].startsWith(':')) params[a[i].slice(1)] = decodeURIComponent(b[i]);
+    else if (a[i] !== b[i]) return null;
+  }
+  return params;
+}
+
+async function handle(ctx0, req) {
+  const now = ctx0.now ? ctx0.now() : Date.now();
+  const ctx = { ...ctx0, now };
+  let state = await ctx.store.load();
+  if (!state) state = ctx.autoSeed && ctx.seed ? await ctx.seed(now) : emptyState();
+  ctx.secret = (ctx.env && ctx.env.SESSION_SECRET) || state.secret || (state.secret = rand(40));
+  pruneRate(state, now);
+  const c = { ctx, state, req, now, query: req.query || {}, body: req.body && typeof req.body === 'object' ? req.body : {} };
+
+  for (const [method, pattern, fn] of ROUTES) {
+    if (method !== req.method) continue;
+    const params = match(pattern, req.path);
+    if (!params) continue;
+    c.params = params;
+    try {
+      const res = await fn(c);
+      if (req.method !== 'GET' || c.dirty) await ctx.store.save(state);
+      return res;
+    } catch (e) {
+      console.error('engine error', e);
+      return err('Something went wrong. Please try again.', 500);
+    }
+  }
+  return err('Not found.', 404);
+}
+
+async function authBiz(c) {
+  const t = bearer(c.req);
+  const p = await readToken(c.ctx.secret, t, c.now);
+  if (!p || p.role !== 'business') return null;
+  const b = getBiz(c.state, p.id);
+  return b && b.status !== 'closed' ? b : null;
+}
+async function authAdmin(c) {
+  const p = await readToken(c.ctx.secret, bearer(c.req), c.now);
+  return !!(p && p.role === 'admin');
+}
+function bearer(req) {
+  const h = (req.headers && (req.headers.authorization || req.headers.Authorization)) || '';
+  return h.startsWith('Bearer ') ? h.slice(7) : '';
+}
+const NEED_LOGIN = () => err('Please sign in again.', 401);
+const ipOf = (c) => c.req.ip || 'unknown';
+const consumerOf = (c) => clean(c.query.consumerId || c.body.consumerId, 60);
+
+// ---------------------------------------------------------------- public routes
+
+async function routeHealth(c) {
+  const env = c.ctx.env || {};
+  return ok({
+    ok: true, mode: c.ctx.demo ? 'demo' : 'live', addressCheck: !!env.GOOGLE_MAPS_API_KEY,
+    googleWallet: !!(env.GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL && env.GOOGLE_WALLET_PRIVATE_KEY && env.GOOGLE_WALLET_ISSUER_ID),
+    categories: CATEGORIES, limits: LIMITS, pilot: PILOT, price: PRICE,
+  });
+}
+
+async function routeDeals(c) {
+  const { state, now, query } = c;
+  const here = isNum(+query.lat) && isNum(+query.lng) && query.lat !== undefined && query.lat !== '' ? { lat: +query.lat, lng: +query.lng } : null;
+  const out = [];
+  for (const d of state.deals) {
+    const b = getBiz(state, d.bizId);
+    if (!b || !isLive(d, b, now)) continue;
+    const full = d.claimCap && state.passes.filter((p) => p.dealId === d.id).length >= d.claimCap;
+    const row = dealPublic(state, d, now, { soldOut: !!full });
+    if (here) row.distance = haversineMiles(here, { lat: b.lat, lng: b.lng });
+    out.push(row);
+  }
+  out.sort((a, b) => (here ? a.distance - b.distance : b.startsAt - a.startsAt));
+  const tips = state.tips.filter((t) => t.status === 'approved').slice(-10).map((t) => ({ id: t.id, name: t.name, address: t.address, note: t.note }));
+  return ok({ deals: out, tips });
+}
+
+async function routeView(c) {
+  const d = getDeal(c.state, clean(c.body.dealId, 40));
+  if (d) {
+    d.views = (d.views || 0) + 1;
+  }
+  return ok({ ok: true });
+}
+
+async function routeClaim(c) {
+  const { state, now, body } = c;
+  const consumerId = clean(body.consumerId, 60);
+  if (!consumerId) return err('Missing shopper id.');
+  const d = getDeal(state, clean(body.dealId, 40));
+  const b = d && getBiz(state, d.bizId);
+  if (!d || !b) return err('That deal was not found.', 404);
+  const existing = state.passes.find((p) => p.dealId === d.id && p.consumerId === consumerId && p.kind === 'deal');
+  if (existing) return ok({ pass: passPublic(state, existing, now), already: true });
+  if (!isLive(d, b, now)) return err('This deal is not available right now.');
+  const saves = state.passes.filter((p) => p.dealId === d.id).length;
+  if (d.claimCap && saves >= d.claimCap) return err('Sorry, all the spots for this deal are taken.');
+  if (usage(state, b, now).saves >= limitsFor(b, now).savesPerMonth) return err('This business has reached its monthly limit of saved passes. Try again next month.');
+
+  const pass = {
+    id: uid('p'), code: makeCode(), referralCode: makeCode(8), kind: 'deal', dealId: d.id, bizId: b.id, consumerId,
+    createdAt: now, stamps: 0, friendSaves: 0, lastRedeemAt: 0,
+  };
+  state.passes.push(pass);
+  const ref = clean(body.ref, 12).toUpperCase();
+  if (ref) {
+    const src = state.passes.find((p) => p.referralCode === ref && p.dealId === d.id && p.consumerId !== consumerId);
+    if (src) {
+      const before = upgradedPass(d, src);
+      src.friendSaves += 1;
+      if (!before && upgradedPass(d, src)) {
+        alertTo(state, c.ctx, src.consumerId, 'upgrade', 'Your pass was upgraded!', `Your friend saved the deal. It is now ${dealLabel(d, true)} at ${b.name}.`, { dealId: d.id, bizId: b.id });
+      }
+    }
+  }
+  return ok({ pass: passPublic(state, pass, now) });
+}
+
+async function routePasses(c) {
+  const consumerId = consumerOf(c);
+  if (!consumerId) return ok({ passes: [] });
+  const list = c.state.passes.filter((p) => p.consumerId === consumerId).sort((a, b) => b.createdAt - a.createdAt).map((p) => passPublic(c.state, p, c.now));
+  return ok({ passes: list });
+}
+
+async function routeWallet(c) {
+  const consumerId = consumerOf(c);
+  const p = c.state.passes.find((x) => x.id === c.params.id && x.consumerId === consumerId);
+  if (!p) return err('Pass not found.', 404);
+  const w = await walletPayloads(c.ctx, c.state, p, c.now);
+  if (c.params.platform === 'google') {
+    return ok({ platform: 'google', payload: w.google, saveUrl: w.google.saveUrl, ready: !!w.google.saveUrl });
+  }
+  if (c.params.platform === 'apple') return ok({ platform: 'apple', payload: w.apple, ready: false, note: 'Apple needs a signed .pkpass file. See guides/WALLET_RADIUS_PUSH.md.' });
+  return err('Unknown wallet.', 404);
+}
+
+async function routeSubscribe(c) {
+  const { state, body, now } = c;
+  const consumerId = clean(body.consumerId, 60);
+  if (!consumerId) return err('Missing shopper id.');
+  let s = state.subscribers.find((x) => x.consumerId === consumerId);
+  if (!s) state.subscribers.push((s = { consumerId, notify: false, lat: 0, lng: 0, updatedAt: now }));
+  s.notify = !!body.notify;
+  if (s.notify) {
+    const lat = Number(body.lat), lng = Number(body.lng);
+    if (!isNum(lat) || !isNum(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return err('We need your location to send nearby alerts.');
+    s.lat = Math.round(lat * 100) / 100; // about 1 km. We never store an exact position.
+    s.lng = Math.round(lng * 100) / 100;
+  } else {
+    s.lat = 0;
+    s.lng = 0;
+  }
+  s.updatedAt = now;
+  return ok({ notify: s.notify });
+}
+
+async function routeAlerts(c) {
+  const consumerId = consumerOf(c);
+  const list = c.state.alerts.filter((a) => a.consumerId === consumerId).sort((a, b) => b.at - a.at).slice(0, 50);
+  const sub = c.state.subscribers.find((s) => s.consumerId === consumerId);
+  return ok({ alerts: list, notify: !!(sub && sub.notify) });
+}
+
+async function routeTip(c) {
+  const { state, body, now } = c;
+  const note = clean(body.note, 200);
+  const name = clean(body.name, 60);
+  if (name.length < 2 || note.length < 5) return err('Add the business name and a short note.');
+  if (hit(state, 'tip:' + ipOf(c), now, 10, HOUR)) return err('Too many tips. Please try again later.', 429);
+  state.tips.push({ id: uid('t'), consumerId: clean(body.consumerId, 60), name, address: clean(body.address, 120), note, status: 'pending', at: now });
+  return ok({ ok: true });
+}
+
+async function routeLogo(c) {
+  const b = getBiz(c.state, c.params.id);
+  const data = b && b.logoV ? await c.ctx.store.getBlob('logo:' + b.id) : null;
+  if (!data) return err('No logo.', 404);
+  const m = /^data:(image\/(?:png|jpeg|webp));base64,(.+)$/.exec(data);
+  if (!m) return err('No logo.', 404);
+  return { status: 200, body: { raw: { contentType: m[1], base64: m[2] } } };
+}
+
+async function routeVerifyAddress(c) {
+  const address = clean(c.body.address, 160);
+  if (address.length < 6) return err('Type the full street address first.');
+  if (hit(c.state, 'geo:' + ipOf(c), c.now, 30, HOUR)) return err('Too many address checks. Please try again later.', 429);
+  const g = await geocode(c.ctx, address);
+  if (g.unavailable) return ok({ available: false, reason: g.reason });
+  if (!g.ok) return ok({ available: true, ok: false, error: g.error, suggestion: g.formatted || null });
+  const shared = c.state.businesses.filter((b) => b.placeId === g.placeId && b.status !== 'closed').length;
+  return ok({ available: true, ok: true, formatted: g.formatted, lat: g.lat, lng: g.lng, placeId: g.placeId, partial: g.partial, sharedWith: shared });
+}
+
+// ---------------------------------------------------------------- business routes
+
+async function routeSignup(c) {
+  const { state, body, now } = c;
+  if (hit(state, 'signup:' + ipOf(c), now, 8, HOUR)) return err('Too many sign-ups from this network. Please try again later.', 429);
+  const email = clean(body.email, 120).toLowerCase();
+  const ownerName = clean(body.ownerName, 60);
+  const name = clean(body.name, 60);
+  const category = body.category;
+  if (ownerName.length < 2) return err('Enter your name.');
+  if (!validEmail(email)) return err('Enter a valid email address.');
+  const pw = passwordProblem(body.password);
+  if (pw) return err(pw);
+  if (name.length < 2) return err('Enter your business name.');
+  if (!CAT_IDS.includes(category)) return err('Pick a category.');
+  const address = clean(body.address, 160);
+  if (address.length < 6) return err('Enter your street address.');
+  if (state.businesses.some((b) => b.email === email)) return err('An account with this email already exists. Try signing in.');
+
+  let lat, lng, formatted = address, placeId = '', verified = false;
+  const g = await geocode(c.ctx, address);
+  if (g.unavailable) {
+    lat = Number(body.lat); lng = Number(body.lng);
+    if (!isNum(lat) || !isNum(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return err('We need a map location for your business. Tap "Use my current location".');
+  } else if (!g.ok) {
+    return err(g.error);
+  } else {
+    ({ lat, lng, placeId } = g);
+    formatted = g.formatted;
+    verified = true;
+  }
+  const hp = await hashPassword(body.password);
+  const emoji = clean(body.emoji, 8) || CATEGORIES.find((x) => x.id === category).emoji;
+  const b = {
+    id: uid('b'), email, ownerName, passSalt: hp.salt, passHash: hp.hash, name, category, emoji,
+    address: formatted, addressRaw: address, addressVerified: verified, placeId, lat, lng, blurb: clean(body.blurb, 120),
+    tier: 'free', pilotEndsAt: 0, pilotStartedAt: 0, status: 'pending', signedUpAt: now, approvedAt: 0,
+    lastLoginAt: now, loginCount: 1, closedAt: 0, logoV: 0,
+  };
+  state.businesses.push(b);
+  log(state, c.ctx, b.id, 'signup', verified ? `Address verified with Google: ${formatted}` : 'Address not verified (check was unavailable)');
+  const draft = makeConcierge(b, now);
+  state.deals.push(draft);
+  log(state, c.ctx, b.id, 'deal_created', `Suggested first deal: ${draft.title}`);
+  const token = await signToken(c.ctx.secret, { role: 'business', id: b.id, exp: now + 12 * HOUR });
+  return ok({ token, business: bizPrivate(state, b, now) }, 201);
+}
+
+async function routeLogin(c) {
+  const { state, body, now } = c;
+  const email = clean(body.email, 120).toLowerCase();
+  const key = 'login:' + email + '|' + ipOf(c);
+  if (limited(state, key, now)) return err('Too many attempts. Please wait 15 minutes and try again.', 429);
+  const b = state.businesses.find((x) => x.email === email);
+  const good = b && typeof body.password === 'string' && safeEqual((await hashPassword(body.password, b.passSalt)).hash, b.passHash);
+  if (!good) {
+    failure(state, key, now);
+    return err('Email or password is not right.', 401);
+  }
+  if (b.status === 'closed') return err('This account was closed. Contact LocalHints support to reopen it.', 403);
+  clearFailures(state, key);
+  b.lastLoginAt = now;
+  b.loginCount = (b.loginCount || 0) + 1;
+  log(state, c.ctx, b.id, 'login', '');
+  const token = await signToken(c.ctx.secret, { role: 'business', id: b.id, exp: now + 12 * HOUR });
+  return ok({ token, business: bizPrivate(state, b, now) });
+}
+
+function loopView(state, l, now) {
+  const from = getBiz(state, l.fromBizId), to = getBiz(state, l.toBizId), d = getDeal(state, l.fromDealId);
+  return { id: l.id, status: l.status, rewardText: l.rewardText, createdAt: l.createdAt, from: bizPublic(from, now), to: bizPublic(to, now), fromDealTitle: d ? d.title : '' };
+}
+
+async function routeMe(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, now } = c;
+  const deals = state.deals.filter((d) => d.bizId === b.id).sort((a, z) => z.createdAt - a.createdAt).map((d) => ownerDeal(state, d, now));
+  const loops = state.loops.filter((l) => (l.fromBizId === b.id || l.toBizId === b.id) && l.status !== 'ended' && l.status !== 'declined').map((l) => loopView(state, l, now));
+  const events = state.events.filter((e) => e.bizId === b.id).sort((a, z) => z.at - a.at).slice(0, 80);
+  return ok({ business: bizPrivate(state, b, now), deals, loops, events, now });
+}
+
+async function routePartners(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const list = c.state.businesses
+    .filter((x) => x.id !== b.id && x.status === 'approved')
+    .map((x) => ({ ...bizPublic(x, c.now), liveDeals: c.state.deals.filter((d) => d.bizId === x.id && isLive(d, x, c.now)).length }));
+  return ok({ partners: list });
+}
+
+async function routeProfile(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, body, now } = c;
+  const name = clean(body.name ?? b.name, 60);
+  if (name.length < 2) return err('Enter your business name.');
+  const changes = [];
+  if (name !== b.name) changes.push('name');
+  b.name = name;
+  if (body.blurb !== undefined) { b.blurb = clean(body.blurb, 120); changes.push('description'); }
+  if (body.emoji !== undefined && clean(body.emoji, 8)) { b.emoji = clean(body.emoji, 8); changes.push('icon'); }
+  if (body.address !== undefined && clean(body.address, 160) !== b.address) {
+    const address = clean(body.address, 160);
+    if (address.length < 6) return err('Enter your street address.');
+    const g = await geocode(c.ctx, address);
+    if (g.unavailable) {
+      const lat = Number(body.lat), lng = Number(body.lng);
+      if (!isNum(lat) || !isNum(lng)) return err('We need a map location for the new address. Tap "Use my current location".');
+      Object.assign(b, { address, addressRaw: address, addressVerified: false, placeId: '', lat, lng });
+    } else if (!g.ok) return err(g.error);
+    else Object.assign(b, { address: g.formatted, addressRaw: address, addressVerified: true, placeId: g.placeId, lat: g.lat, lng: g.lng });
+    changes.push('address');
+  }
+  log(state, c.ctx, b.id, 'profile_updated', changes.join(', ') || 'no changes');
+  return ok({ business: bizPrivate(state, b, now) });
+}
+
+async function routeLogoUpload(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  if (effectiveTier(b, c.now) !== 'pro') return err('Uploading your logo is a Pro feature. Free deals show the LocalHints logo.', 403, { upgrade: true });
+  const data = String(c.body.dataUrl || '');
+  if (!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(data)) return err('Upload a PNG, JPG or WebP image.');
+  if (data.length > 220000) return err('That image is too large. Use one under 150 KB.');
+  await c.ctx.store.putBlob('logo:' + b.id, data);
+  b.logoV = (b.logoV || 0) + 1;
+  log(c.state, c.ctx, b.id, 'logo_updated', 'Uploaded a logo');
+  return ok({ business: bizPrivate(c.state, b, c.now) });
+}
+async function routeLogoRemove(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  await c.ctx.store.putBlob('logo:' + b.id, '');
+  b.logoV = 0;
+  log(c.state, c.ctx, b.id, 'logo_updated', 'Removed the logo');
+  return ok({ business: bizPrivate(c.state, b, c.now) });
+}
+
+async function routeTier(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, body, now } = c;
+  const tier = body.tier;
+  if (tier !== 'free' && tier !== 'pro') return err('Pick Free or Pro.');
+  if (tier === b.tier) return ok({ business: bizPrivate(state, b, now) });
+  if (tier === 'pro' && !c.ctx.demo && !(c.ctx.env && c.ctx.env.ALLOW_SELF_UPGRADE === 'true')) {
+    log(state, c.ctx, b.id, 'upgrade_requested', `Asked to upgrade to Pro (${body.billing === 'yearly' ? 'yearly' : 'monthly'})`);
+    return ok({ business: bizPrivate(state, b, now), requested: true, message: 'Thanks! Billing is not connected yet, so an admin will switch you to Pro. We have let them know.' });
+  }
+  const from = b.tier;
+  b.tier = tier;
+  log(state, c.ctx, b.id, 'tier_changed', `Changed from ${from === 'pro' ? 'Pro' : 'Free'} to ${tier === 'pro' ? 'Pro' : 'Free'}`);
+  return ok({ business: bizPrivate(state, b, now) });
+}
+
+async function routeClose(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  closeBusiness(c, b, 'Closed by the owner');
+  return ok({ closed: true });
+}
+function closeBusiness(c, b, why) {
+  b.status = 'closed';
+  b.closedAt = c.now;
+  for (const d of c.state.deals) if (d.bizId === b.id && d.status !== 'ended') d.status = 'ended';
+  for (const l of c.state.loops) if ((l.fromBizId === b.id || l.toBizId === b.id) && (l.status === 'active' || l.status === 'pending')) l.status = 'ended';
+  log(c.state, c.ctx, b.id, 'closed', why);
+}
+
+function mustOwn(c, b) {
+  const d = getDeal(c.state, c.params.id);
+  return d && d.bizId === b.id ? d : null;
+}
+
+async function routeDealCreate(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  if (b.status === 'closed') return err('This account is closed.', 403);
+  const n = normalizeDeal(b, c.body, c.now, null);
+  if (n.error) return err(n.error, 400, n.upgrade ? { upgrade: true } : undefined);
+  const d = { id: uid('d'), bizId: b.id, ...n.fields, status: 'draft', isConcierge: false, createdAt: c.now, publishedAt: 0, views: 0 };
+  c.state.deals.push(d);
+  log(c.state, c.ctx, b.id, 'deal_created', d.title);
+  let published = null;
+  if (c.body.publish) published = publishDeal(c, b, d);
+  if (published && published.error) return err(published.error, 400, { dealId: d.id, savedAsDraft: true, upgrade: published.upgrade });
+  return ok({ deal: ownerDeal(c.state, d, c.now) }, 201);
+}
+
+function publishDeal(c, b, d) {
+  if (b.status !== 'approved') return { error: b.status === 'pending' ? 'Your business is waiting for approval. Your deal is saved as a draft and you can publish it once you are approved.' : 'Your account is not active, so deals cannot go live.' };
+  if (d.status !== 'draft') return { error: 'This deal is already published.' };
+  const u = usage(c.state, b, c.now);
+  if (u.dealsPublished >= limitsFor(b, c.now).dealsPerMonth) return { error: `Free plan: ${LIMITS.free.dealsPerMonth} published deals per month. Upgrade to Pro for unlimited deals.`, upgrade: true };
+  if (d.startsAt < c.now) {
+    const len = Math.max(HOUR, d.endsAt - d.startsAt);
+    d.startsAt = c.now;
+    d.endsAt = c.now + len;
+  }
+  d.status = 'live';
+  d.publishedAt = c.now;
+  log(c.state, c.ctx, b.id, 'deal_published', d.title);
+  return {};
+}
+
+async function routeDealEdit(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const d = mustOwn(c, b);
+  if (!d) return err('Deal not found.', 404);
+  if (d.status === 'ended') return err('Ended deals cannot be edited.');
+  if (d.status === 'suspended') return err('This deal was suspended by LocalHints and cannot be edited.');
+  const n = normalizeDeal(b, c.body, c.now, d);
+  if (n.error) return err(n.error, 400, n.upgrade ? { upgrade: true } : undefined);
+  Object.assign(d, n.fields);
+  log(c.state, c.ctx, b.id, 'deal_edited', d.title);
+  let published = null;
+  if (c.body.publish && d.status === 'draft') published = publishDeal(c, b, d);
+  if (published && published.error) return err(published.error, 400, { savedAsDraft: true, upgrade: published.upgrade });
+  return ok({ deal: ownerDeal(c.state, d, c.now) });
+}
+
+async function routeDealPublish(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const d = mustOwn(c, b);
+  if (!d) return err('Deal not found.', 404);
+  const r = publishDeal(c, b, d);
+  if (r.error) return err(r.error, 400, r.upgrade ? { upgrade: true } : undefined);
+  return ok({ deal: ownerDeal(c.state, d, c.now) });
+}
+
+async function routeDealStatus(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const d = mustOwn(c, b);
+  if (!d) return err('Deal not found.', 404);
+  const to = c.body.status;
+  if (d.status === 'suspended') return err('This deal was suspended by LocalHints.');
+  if (to === 'paused' && d.status === 'live') d.status = 'paused';
+  else if (to === 'live' && d.status === 'paused') {
+    if (b.status !== 'approved') return err('Your account is not active.');
+    d.status = 'live';
+  } else if (to === 'ended' && (d.status === 'live' || d.status === 'paused' || d.status === 'draft')) {
+    d.status = 'ended';
+    for (const l of c.state.loops) if (l.fromDealId === d.id && (l.status === 'active' || l.status === 'pending')) l.status = 'ended';
+  } else return err('That change is not allowed for this deal.');
+  log(c.state, c.ctx, b.id, 'deal_status', `${d.title}: ${to === 'live' ? 'resumed' : to}`);
+  return ok({ deal: ownerDeal(c.state, d, c.now) });
+}
+
+async function routeDealDelete(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const d = mustOwn(c, b);
+  if (!d) return err('Deal not found.', 404);
+  if (d.status !== 'draft') return err('Only drafts can be deleted. End a published deal instead.');
+  c.state.deals = c.state.deals.filter((x) => x.id !== d.id);
+  log(c.state, c.ctx, b.id, 'deal_deleted', d.title);
+  return ok({ ok: true });
+}
+
+async function routeRedeem(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, now } = c;
+  if (b.status !== 'approved') return err('Your account must be approved before you can redeem passes.');
+  const code = clean(c.body.code, 20).toUpperCase().replace(/^LH-/, '').replace(/[^A-Z0-9]/g, '');
+  const p = state.passes.find((x) => x.code === code && x.bizId === b.id);
+  if (!p) return err('No pass with that code was found for your business.', 404);
+  const d = p.dealId ? getDeal(state, p.dealId) : null;
+  const st = passStatus(p, d, b, now);
+  if (st !== 'active') return err(`This pass cannot be redeemed (${st}).`);
+  if (d && d.minSpend && !c.body.confirmMinSpend && p.stamps === 0) {
+    return err(`This deal needs a minimum spend of $${d.minSpend}. Confirm the customer met it, then redeem again.`, 409, { needsMinSpend: true });
+  }
+  p.stamps += 1;
+  p.lastRedeemAt = now;
+  let message;
+  if (p.kind === 'loop') {
+    message = `Loop reward redeemed: ${p.rewardText}.`;
+    alertTo(state, c.ctx, p.consumerId, 'redeem', 'Reward used', `${p.rewardText} at ${b.name}.`, { bizId: b.id });
+  } else {
+    const done = p.stamps >= d.stamps;
+    message = d.stamps > 1 ? `Stamp ${p.stamps} of ${d.stamps} added.${done ? ' Card complete!' : ''}` : 'Pass redeemed.';
+    alertTo(state, c.ctx, p.consumerId, 'redeem', d.stamps > 1 ? `Stamp ${p.stamps} of ${d.stamps}` : 'Pass redeemed', `${d.title} at ${b.name}.`, { dealId: d.id, bizId: b.id });
+    // Loop-In: first redemption earns the partner reward.
+    const loop = state.loops.find((l) => l.fromDealId === d.id && l.status === 'active');
+    if (loop && p.stamps === 1 && !state.passes.some((x) => x.sourcePassId === p.id)) {
+      const partner = getBiz(state, loop.toBizId);
+      if (partner && partner.status === 'approved') {
+        state.passes.push({
+          id: uid('p'), code: makeCode(), referralCode: '', kind: 'loop', dealId: null, bizId: partner.id, consumerId: p.consumerId,
+          loopId: loop.id, sourcePassId: p.id, rewardText: loop.rewardText, createdAt: now, expiresAt: now + 14 * DAY, stamps: 0, friendSaves: 0, lastRedeemAt: 0,
+        });
+        alertTo(state, c.ctx, p.consumerId, 'loop', `Loop reward unlocked at ${partner.name}`, `${loop.rewardText}. It is in your wallet for 14 days.`, { bizId: partner.id });
+        message += ` The customer also earned a reward at ${partner.name}.`;
+      }
+    }
+  }
+  log(state, c.ctx, b.id, 'redeem', d ? d.title : `Loop reward: ${p.rewardText}`);
+  return ok({ ok: true, message });
+}
+
+async function routeDrop(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, body, now } = c;
+  if (b.status !== 'approved') return err('Your account must be approved first.');
+  const lim = limitsFor(b, now);
+  if (!lim.dropsPerMonth) return err('Neighborhood Drops are a Pro feature.', 403, { upgrade: true });
+  if (usage(state, b, now).drops >= lim.dropsPerMonth) return err(`You have used all ${lim.dropsPerMonth} Neighborhood Drops for this month.`);
+  const d = getDeal(state, clean(body.dealId, 40));
+  if (!d || d.bizId !== b.id || !isLive(d, b, now)) return err('Pick one of your live deals.');
+  const message = clean(body.message, 100);
+  if (message.length < 10) return err('Write a message of 10 to 100 characters.');
+  const radius = Number(body.radius);
+  if (!isNum(radius) || radius < 0.5 || radius > 5) return err('Radius must be between 0.5 and 5 miles.');
+  const here = { lat: b.lat, lng: b.lng };
+  const targets = state.subscribers.filter((s) => s.notify && haversineMiles(here, s) <= radius);
+  for (const s of targets) alertTo(state, c.ctx, s.consumerId, 'drop', `${b.name} is nearby`, message, { dealId: d.id, bizId: b.id });
+  state.drops.push({ id: uid('x'), bizId: b.id, dealId: d.id, radius, message, at: now, reach: targets.length });
+  log(state, c.ctx, b.id, 'drop_sent', `${radius} mi, reached ${targets.length} opted-in shoppers`);
+  return ok({ reach: targets.length, drops: usage(state, b, now).drops });
+}
+
+async function routePush(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, body, now } = c;
+  if (b.status !== 'approved') return err('Your account must be approved first.');
+  if (effectiveTier(b, now) !== 'pro') return err('Pass Push is a Pro feature.', 403, { upgrade: true });
+  const message = clean(body.message, 100);
+  if (message.length < 10) return err('Write a message of 10 to 100 characters.');
+  const holders = new Set();
+  for (const p of state.passes) {
+    if (p.bizId !== b.id || p.kind !== 'deal' || (body.dealId && p.dealId !== body.dealId)) continue;
+    const st = passStatus(p, getDeal(state, p.dealId), b, now);
+    if (st === 'active' || st === 'scheduled' || st === 'paused') holders.add(p.consumerId);
+  }
+  for (const id of holders) alertTo(state, c.ctx, id, 'push', b.name, message, { bizId: b.id });
+  log(state, c.ctx, b.id, 'push_sent', `Sent to ${holders.size} pass holders`);
+  return ok({ reach: holders.size });
+}
+
+async function routeLoopPropose(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, body, now } = c;
+  if (effectiveTier(b, now) !== 'pro') return err('Loop-In is a Pro feature.', 403, { upgrade: true });
+  if (b.status !== 'approved') return err('Your account must be approved first.');
+  const d = getDeal(state, clean(body.fromDealId, 40));
+  if (!d || d.bizId !== b.id || (d.status !== 'live' && d.status !== 'paused' && d.status !== 'draft')) return err('Pick one of your deals.');
+  const partner = getBiz(state, clean(body.partnerBizId, 40));
+  if (!partner || partner.id === b.id || partner.status !== 'approved') return err('Pick an approved neighbor business.');
+  const rewardText = clean(body.rewardText, 80);
+  if (rewardText.length < 5) return err('Describe the reward (5 to 80 characters), for example "$1 off any ice cream cone".');
+  if (state.loops.some((l) => l.fromDealId === d.id && (l.status === 'pending' || l.status === 'active'))) return err('This deal already has a Loop-In. End it first to make a new one.');
+  const l = { id: uid('l'), fromBizId: b.id, fromDealId: d.id, toBizId: partner.id, rewardText, status: 'pending', createdAt: now };
+  state.loops.push(l);
+  log(state, c.ctx, b.id, 'loop_proposed', `${d.title} with ${partner.name}: ${rewardText}`);
+  log(state, c.ctx, partner.id, 'loop_proposed', `${b.name} wants to loop in: ${rewardText}`);
+  return ok({ loop: loopView(state, l, now) }, 201);
+}
+
+async function routeLoopRespond(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const l = c.state.loops.find((x) => x.id === c.params.id);
+  if (!l || (l.toBizId !== b.id && l.fromBizId !== b.id)) return err('Loop-In not found.', 404);
+  const action = c.body.action;
+  if (action === 'accept' && l.toBizId === b.id && l.status === 'pending') {
+    l.status = 'active';
+    log(c.state, c.ctx, b.id, 'loop_accepted', l.rewardText);
+    log(c.state, c.ctx, l.fromBizId, 'loop_accepted', `${b.name} accepted: ${l.rewardText}`);
+  } else if (action === 'decline' && l.toBizId === b.id && l.status === 'pending') {
+    l.status = 'declined';
+    log(c.state, c.ctx, b.id, 'loop_declined', l.rewardText);
+    log(c.state, c.ctx, l.fromBizId, 'loop_declined', `${b.name} declined: ${l.rewardText}`);
+  } else if (action === 'end' && (l.status === 'active' || l.status === 'pending')) {
+    l.status = 'ended';
+    log(c.state, c.ctx, b.id, 'loop_ended', l.rewardText);
+  } else return err('That change is not allowed.');
+  return ok({ loop: loopView(c.state, l, c.now) });
+}
+
+async function routeAnalytics(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, now } = c;
+  const pro = effectiveTier(b, now) === 'pro';
+  const mine = state.deals.filter((d) => d.bizId === b.id && d.status !== 'draft');
+  const rows = mine.map((d) => {
+    const m = dealMetrics(state, d);
+    return {
+      id: d.id, title: d.title, type: d.type, label: dealLabel(d), status: d.status, startsAt: d.startsAt, endsAt: d.endsAt,
+      past: d.status === 'ended' || now >= d.endsAt, ...m,
+      saveRate: m.views ? m.saves / m.views : 0, redeemRate: m.saves ? m.redemptions / m.saves : 0, revenue: Math.round(m.redemptions * AVG_TICKET[b.category]),
+    };
+  }).sort((a, z) => z.startsAt - a.startsAt);
+  const sum = (k) => rows.reduce((n, r) => n + r[k], 0);
+  const totals = { views: sum('views'), saves: sum('saves'), shares: sum('shares'), redemptions: sum('redemptions'), revenue: sum('revenue') };
+  if (!pro) return ok({ locked: true, totals });
+
+  const rate = (n, dn) => (dn ? n / dn : 0);
+  const mineRates = { saveRate: rate(totals.saves, totals.views), redeemRate: rate(totals.redemptions, totals.saves), shareRate: rate(totals.shares, totals.saves) };
+  const peers = state.businesses.filter((x) => x.id !== b.id && x.category === b.category && x.status === 'approved');
+  let pv = 0, ps = 0, pr = 0;
+  for (const x of peers) for (const d of state.deals.filter((q) => q.bizId === x.id && q.status !== 'draft')) {
+    const m = dealMetrics(state, d); pv += m.views; ps += m.saves; pr += m.redemptions;
+  }
+  const bench = peers.length >= 2 && pv >= 50
+    ? { source: 'platform', sample: peers.length, saveRate: rate(ps, pv), redeemRate: rate(pr, ps) }
+    : { source: 'estimate', sample: peers.length, ...BENCH[b.category] };
+
+  const insights = [];
+  const ranked = rows.filter((r) => r.saves >= 5).sort((a, z) => z.redeemRate - a.redeemRate);
+  if (ranked.length) insights.push(`"${ranked[0].title}" is your best deal so far: ${(ranked[0].redeemRate * 100).toFixed(0)}% of people who saved it came in.`);
+  const byType = {};
+  for (const r of ranked) (byType[r.type] ||= []).push(r.redeemRate);
+  const types = Object.entries(byType).map(([t, a]) => [t, a.reduce((x, y) => x + y, 0) / a.length]).sort((a, z) => z[1] - a[1]);
+  if (types.length >= 2) insights.push(`${typeName(types[0][0])} deals bring people in the most for you (${(types[0][1] * 100).toFixed(0)}% redeemed).`);
+  if (totals.views >= 30) {
+    insights.push(mineRates.saveRate >= bench.saveRate
+      ? `Your save rate (${(mineRates.saveRate * 100).toFixed(0)}%) beats the ${(bench.saveRate * 100).toFixed(0)}% neighborhood benchmark.`
+      : `Your save rate (${(mineRates.saveRate * 100).toFixed(0)}%) is under the ${(bench.saveRate * 100).toFixed(0)}% benchmark. Try a stronger title or a bigger first offer.`);
+  }
+  if (totals.saves >= 10 && mineRates.redeemRate < bench.redeemRate) insights.push('Many people save but do not come in. Try a Pass Push reminder or a shorter deal window.');
+  if (!insights.length) insights.push('Run a few deals and we will show what works best.');
+  const best = ranked.length ? ranked[0].id : null;
+  return ok({ locked: false, totals, rates: mineRates, benchmark: bench, deals: rows.map((r) => ({ ...r, best: r.id === best })), insights });
+}
+function typeName(t) {
+  return { percent: '% off', amount: '$ off', bogo: 'Buy-one-get-one', freeitem: 'Free item', bundle: 'Bundle' }[t] || t;
+}
+
+// ---------------------------------------------------------------- admin routes
+
+async function routeAdminLogin(c) {
+  const { state, body, now } = c;
+  const key = 'admin:' + ipOf(c);
+  if (limited(state, key, now)) return err('Too many attempts. Please wait 15 minutes.', 429);
+  const env = c.ctx.env || {};
+  const user = env.ADMIN_USERNAME || 'Admin';
+  const pass = env.ADMIN_PASSWORD || 'Admin';
+  const a = await sha256(String(body.username ?? '') + '\n' + String(body.password ?? ''));
+  const b = await sha256(user + '\n' + pass);
+  if (!safeEqual(a, b)) {
+    failure(state, key, now);
+    c.dirty = true;
+    return err('Username or password is not right.', 401);
+  }
+  clearFailures(state, key);
+  const token = await signToken(c.ctx.secret, { role: 'admin', exp: now + 8 * HOUR });
+  return ok({ token, usingDefaults: !(env.ADMIN_USERNAME && env.ADMIN_PASSWORD) });
+}
+async function routeAdminMe(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const env = c.ctx.env || {};
+  return ok({ ok: true, usingDefaults: !(env.ADMIN_USERNAME && env.ADMIN_PASSWORD), mode: c.ctx.demo ? 'demo' : 'live', addressCheck: !!env.GOOGLE_MAPS_API_KEY });
+}
+
+function adminRow(state, b, now) {
+  const deals = state.deals.filter((d) => d.bizId === b.id);
+  const count = (s) => deals.filter((d) => d.status === s).length;
+  const shared = b.placeId ? state.businesses.some((x) => x.id !== b.id && x.placeId === b.placeId && x.status !== 'closed') : false;
+  const firstPub = deals.filter((d) => d.publishedAt).sort((a, z) => a.publishedAt - z.publishedAt)[0];
+  return {
+    id: b.id, name: b.name, owner: b.ownerName, email: b.email, category: b.category, emoji: b.emoji, address: b.address,
+    addressVerified: b.addressVerified, sharedAddress: shared, status: b.status, tier: b.tier, effectiveTier: effectiveTier(b, now),
+    pilot: isPilot(b, now), pilotEndsAt: b.pilotEndsAt, pilotStartedAt: b.pilotStartedAt,
+    signedUpAt: b.signedUpAt, approvedAt: b.approvedAt, lastLoginAt: b.lastLoginAt, loginCount: b.loginCount || 0, closedAt: b.closedAt,
+    deals: { total: deals.length, live: deals.filter((d) => isLive(d, b, now)).length, draft: count('draft'), paused: count('paused'), suspended: count('suspended'), ended: count('ended') },
+    allDealsSuspended: deals.some((d) => d.status !== 'ended' && d.status !== 'draft') && deals.filter((d) => d.status !== 'ended' && d.status !== 'draft').every((d) => d.status === 'suspended' || d.status === 'paused'),
+    firstDealAt: firstPub ? firstPub.publishedAt : 0,
+    upgradeRequested: state.events.some((e) => e.bizId === b.id && e.type === 'upgrade_requested' && e.at > (b.tierChangedAt || 0)) && b.tier === 'free',
+  };
+}
+const dayStart = (s) => (s ? Date.parse(s + 'T00:00:00Z') : NaN);
+const dayEnd = (s) => (s ? Date.parse(s + 'T00:00:00Z') + DAY - 1 : NaN);
+
+async function routeAdminBusinesses(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const { state, now, query: q } = c;
+  const text = clean(q.q, 80).toLowerCase();
+  const sf = dayStart(q.signedFrom), st = dayEnd(q.signedTo), cf = dayStart(q.closedFrom), ct = dayEnd(q.closedTo);
+  let rows = state.businesses.map((b) => adminRow(state, b, now));
+  rows = rows.filter((r) => {
+    if (text && !(r.name.toLowerCase().includes(text) || r.email.includes(text) || r.owner.toLowerCase().includes(text) || r.address.toLowerCase().includes(text))) return false;
+    if (q.category && r.category !== q.category) return false;
+    if (q.status && r.status !== q.status) return false;
+    if (q.plan === 'pilot' ? !r.pilot : q.plan && r.effectiveTier !== q.plan) return false;
+    if (!Number.isNaN(sf) && r.signedUpAt < sf) return false;
+    if (!Number.isNaN(st) && r.signedUpAt > st) return false;
+    if (!Number.isNaN(cf) && !(r.status === 'closed' && r.closedAt >= cf)) return false;
+    if (!Number.isNaN(ct) && !(r.status === 'closed' && r.closedAt <= ct)) return false;
+    if (q.closedOnly === '1' && r.status !== 'closed') return false;
+    if (q.allSuspended === '1' && !r.allDealsSuspended) return false;
+    if (q.unverified === '1' && r.addressVerified) return false;
+    return true;
+  });
+  const sorts = { name: (a, z) => a.name.localeCompare(z.name), signup: (a, z) => z.signedUpAt - a.signedUpAt, login: (a, z) => z.lastLoginAt - a.lastLoginAt, closed: (a, z) => z.closedAt - a.closedAt };
+  rows.sort(sorts[q.sort] || sorts.signup);
+  return ok({ businesses: rows, total: state.businesses.length });
+}
+
+async function routeAdminStats(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const { state, now } = c;
+  const by = (s) => state.businesses.filter((b) => b.status === s).length;
+  return ok({
+    total: state.businesses.length, pending: by('pending'), approved: by('approved'), suspended: by('suspended'), closed: by('closed'),
+    pro: state.businesses.filter((b) => b.tier === 'pro').length, pilot: state.businesses.filter((b) => isPilot(b, now)).length, pilotSlots: PILOT.slots,
+    liveDeals: state.deals.filter((d) => isLive(d, getBiz(state, d.bizId), now)).length, passes: state.passes.length,
+    tipsPending: state.tips.filter((t) => t.status === 'pending').length, upgradeRequests: state.businesses.filter((b) => adminRow(state, b, now).upgradeRequested).length,
+  });
+}
+
+async function routeAdminBusiness(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const b = getBiz(c.state, c.params.id);
+  if (!b) return err('Business not found.', 404);
+  const { state, now } = c;
+  return ok({
+    business: { ...adminRow(state, b, now), blurb: b.blurb, lat: b.lat, lng: b.lng, placeId: b.placeId, addressRaw: b.addressRaw, hasLogo: !!b.logoV, usage: usage(state, b, now) },
+    deals: state.deals.filter((d) => d.bizId === b.id).sort((a, z) => z.createdAt - a.createdAt).map((d) => ownerDeal(state, d, now)),
+    events: state.events.filter((e) => e.bizId === b.id).sort((a, z) => z.at - a.at).slice(0, 150),
+    loops: state.loops.filter((l) => l.fromBizId === b.id || l.toBizId === b.id).map((l) => loopView(state, l, now)),
+  });
+}
+
+async function routeAdminAction(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const { state, now, body } = c;
+  const b = getBiz(state, c.params.id);
+  if (!b) return err('Business not found.', 404);
+  const a = body.action;
+  if (a === 'approve') {
+    if (b.status !== 'pending') return err('Only pending businesses can be approved.');
+    b.status = 'approved'; b.approvedAt = now;
+    log(state, c.ctx, b.id, 'approved', 'Approved by admin');
+  } else if (a === 'suspend') {
+    if (b.status !== 'approved' && b.status !== 'pending') return err('Only pending or approved businesses can be suspended.');
+    b.status = 'suspended';
+    for (const d of state.deals) if (d.bizId === b.id && (d.status === 'live' || d.status === 'paused')) { d.suspendedFrom = d.status; d.status = 'suspended'; }
+    log(state, c.ctx, b.id, 'suspended', clean(body.reason, 120) || 'Suspended by admin');
+  } else if (a === 'reinstate') {
+    if (b.status !== 'suspended') return err('Only suspended businesses can be reinstated.');
+    b.status = b.approvedAt ? 'approved' : 'pending';
+    for (const d of state.deals) if (d.bizId === b.id && d.status === 'suspended') { d.status = d.suspendedFrom || 'paused'; d.suspendedFrom = null; }
+    log(state, c.ctx, b.id, 'reinstated', 'Reinstated by admin');
+  } else if (a === 'close') {
+    if (b.status === 'closed') return err('Already closed.');
+    closeBusiness(c, b, clean(body.reason, 120) || 'Closed by admin');
+  } else if (a === 'reopen') {
+    if (b.status !== 'closed') return err('Only closed accounts can be reopened.');
+    b.status = 'approved'; b.approvedAt = b.approvedAt || now;
+    log(state, c.ctx, b.id, 'reopened', 'Reopened by admin');
+  } else if (a === 'set_tier') {
+    if (body.tier !== 'free' && body.tier !== 'pro') return err('Pick Free or Pro.');
+    if (b.tier !== body.tier) {
+      log(state, c.ctx, b.id, 'tier_changed', `Changed from ${b.tier === 'pro' ? 'Pro' : 'Free'} to ${body.tier === 'pro' ? 'Pro' : 'Free'} by admin`);
+      b.tier = body.tier; b.tierChangedAt = now;
+    }
+  } else if (a === 'start_pilot') {
+    if (b.status !== 'approved') return err('Approve the business before starting its pilot.');
+    if (isPilot(b, now)) return err('Already in the pilot.');
+    if (state.businesses.filter((x) => isPilot(x, now)).length >= PILOT.slots) return err(`All ${PILOT.slots} pilot slots are in use.`);
+    b.pilotStartedAt = now; b.pilotEndsAt = now + PILOT.days * DAY;
+    log(state, c.ctx, b.id, 'pilot_started', `${PILOT.days}-day Pro pilot`);
+  } else if (a === 'end_pilot') {
+    if (!isPilot(b, now)) return err('Not in the pilot.');
+    b.pilotEndsAt = now;
+    log(state, c.ctx, b.id, 'pilot_ended', 'Ended by admin');
+  } else return err('Unknown action.');
+  return ok({ business: adminRow(state, b, now) });
+}
+
+async function routeAdminEvents(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const { state, query: q } = c;
+  const type = q.type;
+  const list = state.events.filter((e) => !type || e.type === type).sort((a, z) => z.at - a.at).slice(0, 200)
+    .map((e) => { const b = getBiz(state, e.bizId); return { ...e, bizName: b ? b.name : '(deleted)' }; });
+  return ok({ events: list });
+}
+
+async function routeAdminPilot(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const { state, now } = c;
+  const rows = state.businesses.filter((b) => b.pilotStartedAt).map((b) => {
+    const r = adminRow(state, b, now);
+    return { ...r, daysLeft: Math.max(0, Math.ceil((b.pilotEndsAt - now) / DAY)), daysToApproval: b.approvedAt ? Math.round((b.approvedAt - b.signedUpAt) / DAY) : null, daysToFirstDeal: r.firstDealAt ? Math.round((r.firstDealAt - b.signedUpAt) / DAY) : null,
+      saves: state.passes.filter((p) => p.bizId === b.id && p.kind === 'deal').length, redemptions: state.passes.filter((p) => p.bizId === b.id && p.stamps > 0).length };
+  });
+  return ok({ slots: PILOT.slots, used: rows.filter((r) => r.pilot).length, rows });
+}
+
+async function routeAdminTips(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  return ok({ tips: c.state.tips.slice().sort((a, z) => z.at - a.at).slice(0, 100) });
+}
+async function routeAdminTip(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const t = c.state.tips.find((x) => x.id === c.params.id);
+  if (!t) return err('Tip not found.', 404);
+  if (c.body.action !== 'approve' && c.body.action !== 'reject') return err('Unknown action.');
+  t.status = c.body.action === 'approve' ? 'approved' : 'rejected';
+  return ok({ tip: t });
+}
+
+async function routeAdminSeed(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  if (!c.ctx.seed) return err('Demo data is not available here.');
+  const fresh = await c.ctx.seed(c.now);
+  const secret = c.state.secret;
+  for (const k of Object.keys(c.state)) delete c.state[k];
+  Object.assign(c.state, fresh, { secret });
+  return ok({ ok: true });
+}
+async function routeAdminReset(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  if (c.body.confirm !== 'DELETE') return err('Type DELETE to confirm.');
+  const secret = c.state.secret;
+  for (const k of Object.keys(c.state)) delete c.state[k];
+  Object.assign(c.state, emptyState(), { secret });
+  return ok({ ok: true });
+}
+
+const ROUTES = [
+  ['GET', '/api/health', routeHealth],
+  ['GET', '/api/deals', routeDeals],
+  ['POST', '/api/view', routeView],
+  ['POST', '/api/claim', routeClaim],
+  ['GET', '/api/passes', routePasses],
+  ['GET', '/api/wallet/:platform/:id', routeWallet],
+  ['POST', '/api/subscribe', routeSubscribe],
+  ['GET', '/api/alerts', routeAlerts],
+  ['POST', '/api/tips', routeTip],
+  ['GET', '/api/logo/:id', routeLogo],
+  ['POST', '/api/address/verify', routeVerifyAddress],
+  ['POST', '/api/business/signup', routeSignup],
+  ['POST', '/api/business/login', routeLogin],
+  ['GET', '/api/business/me', routeMe],
+  ['GET', '/api/business/partners', routePartners],
+  ['POST', '/api/business/profile', routeProfile],
+  ['POST', '/api/business/logo', routeLogoUpload],
+  ['POST', '/api/business/logo/remove', routeLogoRemove],
+  ['POST', '/api/business/tier', routeTier],
+  ['POST', '/api/business/close', routeClose],
+  ['POST', '/api/business/deals', routeDealCreate],
+  ['POST', '/api/business/deals/:id/edit', routeDealEdit],
+  ['POST', '/api/business/deals/:id/publish', routeDealPublish],
+  ['POST', '/api/business/deals/:id/status', routeDealStatus],
+  ['POST', '/api/business/deals/:id/delete', routeDealDelete],
+  ['POST', '/api/business/redeem', routeRedeem],
+  ['POST', '/api/business/drop', routeDrop],
+  ['POST', '/api/business/push', routePush],
+  ['POST', '/api/business/loops', routeLoopPropose],
+  ['POST', '/api/business/loops/:id', routeLoopRespond],
+  ['GET', '/api/business/analytics', routeAnalytics],
+  ['POST', '/api/admin/login', routeAdminLogin],
+  ['GET', '/api/admin/me', routeAdminMe],
+  ['GET', '/api/admin/stats', routeAdminStats],
+  ['GET', '/api/admin/businesses', routeAdminBusinesses],
+  ['GET', '/api/admin/businesses/:id', routeAdminBusiness],
+  ['POST', '/api/admin/businesses/:id/action', routeAdminAction],
+  ['GET', '/api/admin/events', routeAdminEvents],
+  ['GET', '/api/admin/pilot', routeAdminPilot],
+  ['GET', '/api/admin/tips', routeAdminTips],
+  ['POST', '/api/admin/tips/:id', routeAdminTip],
+  ['POST', '/api/admin/seed', routeAdminSeed],
+  ['POST', '/api/admin/reset', routeAdminReset],
+];
+
+// ===== seed.js =====
+/*
+ * Demo data. Used in demo mode automatically, and by the Admin "Load demo data" button.
+ * Every demo business can sign in with password: demo1234
+ * Example: owner@brewandbean.demo (Pro), owner@sunnybakery.demo (Free).
+ */
+
+const DEMO_PASSWORD = 'demo1234';
+const DEMO_LOGINS = [
+  { email: 'owner@brewandbean.demo', note: 'Pro plan, approved, has past deals and analytics' },
+  { email: 'owner@sunnybakery.demo', note: 'Free plan, approved' },
+  { email: 'owner@luigis.demo', note: 'Pro plan, has a live Loop-In with Scoops' },
+  { email: 'owner@scoops.demo', note: 'Free plan, approved (try accepting a Loop-In from Luigi’s)' },
+  { email: 'owner@pagesbooks.demo', note: 'Pending approval (just signed up)' },
+];
+
+let seq = 0;
+const id = (p) => p + 'seed' + (++seq).toString(36).padStart(4, '0');
+const at = (lat, lng) => ({ lat: DEMO_CENTER.lat + lat, lng: DEMO_CENTER.lng + lng });
+
+async function buildSeed(now) {
+  seq = 0;
+  const s = emptyState();
+  const pw = await hashPassword(DEMO_PASSWORD);
+  const ev = (bizId, type, detail, when) => s.events.push({ id: id('e'), bizId, type, detail, at: when });
+
+  const mk = (o) => {
+    const b = {
+      id: id('b'), passSalt: pw.salt, passHash: pw.hash, tier: 'free', pilotEndsAt: 0, pilotStartedAt: 0, status: 'approved',
+      approvedAt: 0, closedAt: 0, logoV: 0, addressVerified: false, placeId: '', loginCount: 1, blurb: '', ...o,
+    };
+    b.addressRaw = b.address;
+    s.businesses.push(b);
+    ev(b.id, 'signup', 'Demo business', b.signedUpAt);
+    if (b.approvedAt) ev(b.id, 'approved', 'Approved by admin', b.approvedAt);
+    return b;
+  };
+
+  const brew = mk({ email: 'owner@brewandbean.demo', ownerName: 'Maria Lopez', name: 'Brew & Bean', category: 'cafe', emoji: '☕', address: '12 Maple Street', ...at(0.002, -0.004), blurb: 'Small-batch coffee since 2016.', tier: 'pro', signedUpAt: now - 120 * DAY, approvedAt: now - 119 * DAY, lastLoginAt: now - 1 * DAY, loginCount: 41 });
+  const sunny = mk({ email: 'owner@sunnybakery.demo', ownerName: 'Sam Patel', name: 'Sunny Side Bakery', category: 'cafe', emoji: '🥐', address: '48 Oak Avenue', ...at(-0.004, 0.003), blurb: 'Fresh bread and pastries.', signedUpAt: now - 60 * DAY, approvedAt: now - 58 * DAY, lastLoginAt: now - 3 * DAY, loginCount: 14 });
+  const taco = mk({ email: 'owner@tacocorner.demo', ownerName: 'Luis Ortega', name: 'Taco Corner', category: 'food', emoji: '🌮', address: '7 Elm Court', ...at(0.006, 0.005), blurb: 'Street tacos, made fresh.', signedUpAt: now - 35 * DAY, approvedAt: now - 34 * DAY, pilotStartedAt: now - 30 * DAY, pilotEndsAt: now + 30 * DAY, lastLoginAt: now - 2 * HOUR, loginCount: 22 });
+  const luigi = mk({ email: 'owner@luigis.demo', ownerName: 'Luigi Romano', name: "Luigi's Pizzeria", category: 'food', emoji: '🍕', address: '90 Main Street', ...at(-0.001, -0.002), blurb: 'Wood-fired pizza by the slice.', tier: 'pro', signedUpAt: now - 80 * DAY, approvedAt: now - 79 * DAY, lastLoginAt: now - 5 * HOUR, loginCount: 30 });
+  const scoops = mk({ email: 'owner@scoops.demo', ownerName: 'Priya Shah', name: 'Scoops Ice Cream', category: 'dessert', emoji: '🍦', address: '92 Main Street', ...at(-0.001, -0.0015), blurb: 'Small-batch ice cream.', signedUpAt: now - 45 * DAY, approvedAt: now - 44 * DAY, lastLoginAt: now - 9 * DAY, loginCount: 9 });
+  const books = mk({ email: 'owner@pagesbooks.demo', ownerName: 'Ana Gomez', name: 'Page Turner Books', category: 'retail', emoji: '📚', address: '3 Library Lane', ...at(0.004, -0.006), blurb: 'Independent bookstore.', status: 'pending', signedUpAt: now - 2 * DAY, lastLoginAt: now - 2 * DAY, loginCount: 1 });
+  const gym = mk({ email: 'owner@ironworks.demo', ownerName: 'Dan Kim', name: 'Iron Works Gym', category: 'fitness', emoji: '💪', address: '15 Industrial Way', ...at(0.009, 0.008), blurb: 'Strength training.', status: 'suspended', signedUpAt: now - 70 * DAY, approvedAt: now - 69 * DAY, lastLoginAt: now - 12 * DAY, loginCount: 6 });
+  const clean = mk({ email: 'owner@oldtown.demo', ownerName: 'Grace Lee', name: 'Old Town Cleaners', category: 'services', emoji: '🧺', address: '210 Station Road', ...at(-0.008, 0.004), blurb: 'Dry cleaning and tailoring.', status: 'closed', signedUpAt: now - 150 * DAY, approvedAt: now - 149 * DAY, closedAt: now - 20 * DAY, lastLoginAt: now - 21 * DAY, loginCount: 8 });
+
+  // Timeline extras so the admin history looks real.
+  ev(brew.id, 'tier_changed', 'Changed from Free to Pro', now - 100 * DAY);
+  ev(taco.id, 'pilot_started', '60-day Pro pilot', now - 30 * DAY);
+  ev(luigi.id, 'tier_changed', 'Changed from Free to Pro', now - 60 * DAY);
+  ev(gym.id, 'suspended', 'Reported by a customer for misleading offers', now - 11 * DAY);
+  ev(clean.id, 'closed', 'Closed by the owner', now - 20 * DAY);
+  ev(scoops.id, 'login', '', now - 9 * DAY);
+
+  let consumer = 0;
+  const addDeal = (b, o, views, saves, redeemed, shares = 0) => {
+    const d = {
+      id: id('d'), bizId: b.id, title: '', description: '', type: 'percent', value: 10, itemText: '', minSpend: 0, status: 'ended', isConcierge: false,
+      startsAt: 0, endsAt: 0, createdAt: o.startsAt - DAY, publishedAt: o.startsAt, claimCap: 0, stamps: 1, color: '#0d9488', upgrade: null, views, ...o,
+    };
+    s.deals.push(d);
+    ev(b.id, 'deal_created', d.title, d.createdAt);
+    if (d.publishedAt) ev(b.id, 'deal_published', d.title, d.publishedAt);
+    for (let i = 0; i < saves; i++) {
+      const sh = i < shares ? 1 : 0;
+      s.passes.push({
+        id: id('p'), code: 'S' + consumer.toString(36).toUpperCase().padStart(5, '0'), referralCode: 'R' + String(consumer).padStart(7, '0'), kind: 'deal', dealId: d.id, bizId: b.id,
+        consumerId: 'seed-consumer-' + consumer++, createdAt: d.startsAt + (i % 6) * HOUR + HOUR, stamps: i < redeemed ? d.stamps : 0, friendSaves: sh, lastRedeemAt: i < redeemed ? d.startsAt + 2 * DAY : 0,
+      });
+    }
+    return d;
+  };
+
+  // Brew & Bean (Pro): three past deals and two live
+  addDeal(brew, { title: '$1 off any latte', type: 'amount', value: 1, startsAt: now - 90 * DAY, endsAt: now - 83 * DAY }, 310, 62, 14, 6);
+  addDeal(brew, { title: 'Buy one get one pastry', type: 'bogo', itemText: 'Buy any pastry, get a second free', startsAt: now - 60 * DAY, endsAt: now - 40 * DAY }, 420, 118, 61, 22);
+  addDeal(brew, { title: '15% off morning orders', type: 'percent', value: 15, startsAt: now - 30 * DAY, endsAt: now - 16 * DAY }, 280, 54, 12, 4);
+  addDeal(brew, { title: 'Coffee punch card', description: 'Buy 5 drinks, the 5th is free.', type: 'freeitem', itemText: 'Free drink after 5 stamps', stamps: 5, status: 'live', startsAt: now - 6 * DAY, endsAt: now + 24 * DAY }, 190, 41, 9, 0);
+  addDeal(brew, { title: '20% off, upgrades to 30% with friends', description: 'Save it, share it, and get a bigger discount.', type: 'percent', value: 20, upgrade: { friendsNeeded: 2, upgradedValue: 30 }, status: 'live', startsAt: now - 2 * DAY, endsAt: now + 12 * DAY }, 120, 33, 4, 8);
+
+  // Sunny Side (Free): suggested first deal edited and live, plus one ended
+  addDeal(sunny, { title: '$2 off any drink', description: 'Treat yourself.', type: 'amount', value: 2, status: 'ended', startsAt: now - 30 * DAY, endsAt: now - 23 * DAY, isConcierge: true }, 140, 31, 8);
+  addDeal(sunny, { title: 'Free cookie with any coffee', type: 'percent', value: 10, status: 'live', startsAt: now - 3 * DAY, endsAt: now + 4 * DAY }, 95, 22, 5);
+
+  // Taco Corner (pilot)
+  addDeal(taco, { title: 'Taco Tuesday: 2 for $5', type: 'bundle', value: 5, itemText: 'Two street tacos', status: 'live', startsAt: now - 4 * DAY, endsAt: now + 18 * DAY }, 260, 70, 18, 7);
+
+  // Luigi's (Pro) with an active loop to Scoops
+  const slice = addDeal(luigi, { title: 'Free garlic knots with any pizza', type: 'freeitem', itemText: 'Garlic knots with any whole pizza', status: 'live', startsAt: now - 5 * DAY, endsAt: now + 25 * DAY }, 210, 52, 15, 0);
+  const slice2 = addDeal(luigi, { title: '$3 off a whole pie', type: 'amount', value: 3, status: 'live', startsAt: now - 1 * DAY, endsAt: now + 13 * DAY }, 64, 12, 2, 0);
+
+  // Scoops (Free): suggested deal, not published yet
+  const scoopDraft = addDeal(scoops, { title: '10% off any treat', description: 'Something sweet for less.', type: 'percent', value: 10, status: 'draft', isConcierge: true, startsAt: now - 3 * DAY, endsAt: now + 4 * DAY, publishedAt: 0 }, 0, 0, 0);
+  void scoopDraft;
+  // Page Turner (pending): suggested draft only
+  s.deals.push({ id: id('d'), bizId: books.id, title: '15% off one item', description: 'Take 15% off one full-price item.', type: 'percent', value: 15, itemText: '', minSpend: 0, status: 'draft', isConcierge: true, startsAt: now - 2 * DAY, endsAt: now + 5 * DAY, createdAt: now - 2 * DAY, publishedAt: 0, claimCap: 0, stamps: 1, color: '#0d9488', upgrade: null, views: 0 });
+  ev(books.id, 'deal_created', 'Suggested first deal: 15% off one item', now - 2 * DAY);
+
+  // Gym (suspended) and cleaners (closed)
+  const gd = addDeal(gym, { title: '$10 off your first class', type: 'amount', value: 10, status: 'suspended', suspendedFrom: 'live', startsAt: now - 14 * DAY, endsAt: now + 14 * DAY }, 80, 12, 1);
+  void gd;
+  addDeal(clean, { title: '10% off dry cleaning', type: 'percent', value: 10, status: 'ended', startsAt: now - 60 * DAY, endsAt: now - 53 * DAY }, 70, 9, 3);
+
+  // Loop-In: Luigi's -> Scoops active; Brew -> Sunny pending (Sunny can accept)
+  s.loops.push({ id: id('l'), fromBizId: luigi.id, fromDealId: slice.id, toBizId: scoops.id, rewardText: '$1 off any ice cream cone', status: 'active', createdAt: now - 10 * DAY });
+  ev(luigi.id, 'loop_proposed', "Free garlic knots with Scoops: $1 off any ice cream cone", now - 11 * DAY);
+  ev(scoops.id, 'loop_accepted', "Luigi's Pizzeria loop: $1 off any ice cream cone", now - 10 * DAY);
+  const liveBrew = s.deals.find((d) => d.bizId === brew.id && d.status === 'live' && d.stamps === 5);
+  s.loops.push({ id: id('l'), fromBizId: brew.id, fromDealId: liveBrew.id, toBizId: sunny.id, rewardText: '50 cents off any cookie', status: 'pending', createdAt: now - 1 * DAY });
+  ev(brew.id, 'loop_proposed', 'Coffee punch card with Sunny Side Bakery: 50 cents off any cookie', now - 1 * DAY);
+  ev(sunny.id, 'loop_proposed', 'Brew & Bean wants to loop in: 50 cents off any cookie', now - 1 * DAY);
+  void slice2;
+
+  // A few extra history events
+  ev(brew.id, 'login', '', now - 1 * DAY);
+  ev(taco.id, 'login', '', now - 2 * HOUR);
+  ev(luigi.id, 'login', '', now - 5 * HOUR);
+  ev(sunny.id, 'deal_edited', 'Free cookie with any coffee', now - 3 * DAY);
+
+  s.tips.push(
+    { id: id('t'), consumerId: 'seed-consumer-1', name: 'Hot Pot House', address: '55 Pine Street', note: 'Lunch special: 20% off before 2pm', status: 'pending', at: now - 1 * DAY },
+    { id: id('t'), consumerId: 'seed-consumer-2', name: 'Fresh Cuts Barber', address: '4 Market Square', note: 'First haircut free for students on Mondays', status: 'approved', at: now - 4 * DAY },
+  );
+  s.events.sort((a, z) => a.at - z.at);
+  return s;
+}
+
+// ===== index.js =====
+/*
+ * LocalHints Cloudflare Worker.
+ * A thin wrapper: it receives HTTP requests, hands them to the shared engine
+ * (docs/js/engine.js, where ALL the rules live), and keeps data in Cloudflare KV.
+ *
+ * Secrets / variables (Cloudflare dashboard > your Worker > Settings > Variables and Secrets):
+ *   ADMIN_USERNAME, ADMIN_PASSWORD   Admin login (default Admin / Admin until you set them)
+ *   SESSION_SECRET                   long random text used to sign login tokens
+ *   ALLOWED_ORIGIN                   your site, e.g. https://yourname.github.io (default: any site)
+ *   GOOGLE_MAPS_API_KEY              turns on Google address verification (Geocoding API)
+ *   GOOGLE_WALLET_ISSUER_ID, GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL, GOOGLE_WALLET_PRIVATE_KEY
+ *                                    turns on "Save to Google Wallet"
+ *   ALLOW_SELF_UPGRADE               "true" lets businesses switch to Pro themselves (testing only)
+ */
+
+const STATE_KEY = 'state';
+
+function kvStore(kv) {
+  return {
+    async load() {
+      const raw = await kv.get(STATE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    },
+    async save(state) {
+      await kv.put(STATE_KEY, JSON.stringify(state));
+    },
+    async getBlob(key) {
+      return kv.get('blob:' + key);
+    },
+    async putBlob(key, value) {
+      if (value) await kv.put('blob:' + key, value);
+      else await kv.delete('blob:' + key);
+    },
+  };
+}
+
+function corsHeaders(request, env) {
+  const allowed = env.ALLOWED_ORIGIN || '*';
+  return {
+    'Access-Control-Allow-Origin': allowed,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Max-Age': '86400',
+    Vary: 'Origin',
+  };
+}
+
+function json(data, status, extra) {
+  return new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...extra } });
+}
+
+export default {
+  async fetch(request, env) {
+    const cors = corsHeaders(request, env);
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+    const url = new URL(request.url);
+    if (!url.pathname.startsWith('/api/')) return json({ ok: true, service: 'localhints-worker', hint: 'Use /api/health' }, 200, cors);
+    if (!env.LH_KV) return json({ error: 'The LH_KV storage binding is missing. See guides/CLOUDFLARE_WORKER.md.' }, 500, cors);
+
+    let body;
+    if (request.method === 'POST') {
+      try {
+        const text = await request.text();
+        if (text.length > 400000) return json({ error: 'Request too large.' }, 413, cors);
+        body = text ? JSON.parse(text) : {};
+      } catch {
+        return json({ error: 'Invalid JSON.' }, 400, cors);
+      }
+    }
+    const result = await handle(
+      { store: kvStore(env.LH_KV), env, demo: false, seed: buildSeed, autoSeed: false, fetch: (u, o) => fetch(u, o), origin: env.ALLOWED_ORIGIN && env.ALLOWED_ORIGIN !== '*' ? env.ALLOWED_ORIGIN : '' },
+      {
+        method: request.method,
+        path: url.pathname,
+        query: Object.fromEntries(url.searchParams),
+        body,
+        headers: { authorization: request.headers.get('Authorization') || '' },
+        ip: request.headers.get('CF-Connecting-IP') || 'unknown',
+      },
+    );
+
+    if (result.body && result.body.raw) {
+      const bytes = Uint8Array.from(atob(result.body.raw.base64), (ch) => ch.charCodeAt(0));
+      return new Response(bytes, { status: result.status, headers: { 'content-type': result.body.raw.contentType, 'cache-control': 'public, max-age=86400', ...cors } });
+    }
+    return json(result.body, result.status, cors);
+  },
+};

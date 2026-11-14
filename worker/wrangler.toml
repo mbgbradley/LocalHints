@@ -1,0 +1,9 @@
+name = "localhints-api"
+main = "index.js"
+compatibility_date = "2024-11-01"
+
+# Storage for all LocalHints data. Newer versions of Wrangler create this for you on deploy.
+# If the deploy says it needs an id: Cloudflare dashboard > Storage & Databases > KV > Create,
+# then add a line  id = "your-namespace-id"  under [[kv_namespaces]].
+[[kv_namespaces]]
+binding = "LH_KV"

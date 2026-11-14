@@ -1,45 +1,30 @@
 # LocalHints
 
-Mobile-first web app for hyper-local deals delivered as Apple/Google Wallet passes. This is a working
-prototype to build on: shoppers browse a list or map of nearby deals, businesses sign up and publish deals,
-and an admin approves them. See `CLAUDE.md` for architecture and rules, and `docs/WALLET_RADIUS_PUSH.md` for how
-radius drops and wallet passes will work, and `docs/STEP_BY_STEP.md` for a beginner-friendly setup guide.
+Hyper-local deals that shoppers save to their Apple or Google Wallet. Plain HTML, CSS and JavaScript, with the
+business logic in one file that runs either in the browser (demo mode) or in a Cloudflare Worker (live mode).
 
-## Run
+| Page | File | Who |
+|---|---|---|
+| Shoppers | `docs/index.html` | Discover list + map, Main Street Loop feed, wallet passes, nearby alerts, PWA |
+| Business | `docs/business.html` | Sign up (with Google address check), Free/Pro plans, deals, Neighborhood Drops, Loop-In, insights, logo |
+| Admin | `docs/admin.html` | Search and manage businesses, dates log, pilot, moderation |
 
-```bash
-npm install
-npm run dev          # http://localhost:3000
-npm run typecheck
-npm run build
+## Folders
+
+```
+docs/        The website. GitHub Pages serves this folder.
+  js/engine.js   ALL business rules and the API. Runs in the browser (demo) and in the Worker (live).
+  js/config.js   The one setting: API_BASE ("" = demo mode, or your Worker URL = live mode)
+worker/      Cloudflare Worker (index.js) + a paste-in single-file copy (worker-single-file.js)
+guides/      STEP_BY_STEP.md (beginner setup), CLOUDFLARE_WORKER.md (reference), WALLET_RADIUS_PUSH.md
+CLAUDE.md    Project notes for Claude
 ```
 
-## Pages
+## Try it now (demo mode)
 
-| URL | Who | What |
-|---|---|---|
-| `/` | Shoppers | Deals near you, list and map views, wallet, profile |
-| `/business` | Business owners | Create account or sign in, dashboard, deal builder, drops, analytics |
-| `/admin` | You | Server-side sign-in, approvals, moderation, plans, pilot |
+1. Put the repo on GitHub, then Settings → Pages → Deploy from branch `main`, folder `/docs`.
+2. Open the Pages URL. Everything works with sample data, stored in your browser.
+3. Logins in demo mode: Admin / Admin at `admin.html`; businesses at `business.html` (password `demo1234`,
+   for example `owner@brewandbean.demo`).
 
-## Logins (demo)
-
-- **Admin:** username `Admin`, password `Admin`. Change before sharing publicly (see below).
-- **Business demo account:** `owner@brewandbean.demo` / `demo1234` (owns three sample businesses).
-  You can also create your own account at `/business`.
-
-## Deploy to Vercel
-
-1. Push this folder to a GitHub repository and import it in Vercel (no build settings needed).
-2. Add environment variables (Project Settings → Environment Variables):
-   `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `SESSION_SECRET` (see `.env.example`).
-3. Open the Vercel URL on your phone. HTTPS is required for secure business sign-in (Web Crypto).
-
-## Important prototype limits
-
-- Shopper, business and deal data is stored in each browser's `localStorage`. A business that signs up on one
-  device will not appear to an admin on another device. Use one browser to test the whole loop, or move the
-  store to Supabase (`lib/store.tsx` is the only file to change).
-- Admin sign-in is genuinely server-side (signed HttpOnly cookie). Business accounts are browser-only
-  prototypes with hashed passwords.
-- Map tiles load from CARTO/OpenStreetMap over the internet.
+To go live, follow `guides/STEP_BY_STEP.md`.
