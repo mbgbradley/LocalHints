@@ -5,5 +5,5 @@
  *   API_BASE: "https://localhints-api.YOU.workers.dev" -> Live mode (your Cloudflare Worker)
  */
 window.LH_CONFIG = {
-  API_BASE: '',
+  API_BASE: 'https://localhints-api.mbgbradley.workers.dev',
 };
