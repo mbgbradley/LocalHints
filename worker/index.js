@@ -11,6 +11,10 @@
  *   GOOGLE_WALLET_ISSUER_ID, GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL, GOOGLE_WALLET_PRIVATE_KEY
  *                                    turns on "Save to Google Wallet"
  *   ALLOW_SELF_UPGRADE               "true" lets businesses switch to Pro themselves (testing only)
+ *   SITE_URL                         your website address, e.g. https://yourname.github.io/localhints (used in reset and invite links)
+ *   RESEND_API_KEY, EMAIL_FROM       turns on sending email (password reset, team invites) through Resend
+ *   ADMIN_EMAIL                      where the admin "Forgot password" link is sent
+ *   ANTHROPIC_API_KEY, AI_MODEL      optional: lets "What to try next" use Claude (AI_MODEL defaults to claude-haiku-5-5)
  */
 import { handle } from '../docs/js/engine.js';
 import { buildSeed } from '../docs/js/seed.js';

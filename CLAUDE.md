@@ -10,16 +10,22 @@ JavaScript** with no build step and no npm dependencies.
 ```
 docs/                 Static site, served by GitHub Pages (Settings > Pages > main > /docs)
   index.html          Shopper side:  discover list + map, Main Street Loop, wallet, alerts (PWA)
-  business.html       Merchant side: sign up, Free/Pro, deals, reach, Loop-In, insights, account
-  admin.html          Admin side:    business search + history, activity log, pilot, moderation, settings
+  business.html       Merchant side: sign up, Free/Pro, deals, team (redeem agent), reach, Loop-In, insights (graphs), account (locations)
+  admin.html          Admin side:    clickable count tiles, business search + inline details, live deals, activity log, pilot, spotted deals, settings
+  staff.html          Team member (clerk) page: join from an invite, redeem passes. No dashboard.
   css/styles.css      All styling (CSS variables, phone first, dashboard layout from 900px)
   js/config.js        window.LH_CONFIG.API_BASE: "" = demo mode, "https://....workers.dev" = live mode
   js/engine.js        ALL business rules + the whole HTTP-style API. Single source of truth.
   js/seed.js          Demo data (all demo logins use password demo1234)
   js/api.js           Pages call api.get/post. Routes to the in-browser engine (demo) or the Worker (live)
-  js/ui.js            Escaping, dates, sheets, toasts, QR (CDN), Leaflet loader
-  js/consumer.js, business.js, admin.js   One script per page
-  sw.js, manifest.webmanifest, icon*      PWA files
+  js/ui.js            Escaping, dates, history-aware sheets, toasts, QR (CDN), Leaflet loader, light/dark theme, install-to-home-screen, settings sheet
+  js/nav.js           Back-button support: navigate()/replaceScreen() add history entries; sheets reuse them
+  js/icons.js         Single-color SVG icon set (currentColor)
+  js/charts.js        Hand-built SVG line + paired-bar charts (colors --s1..--s5, legend toggles, tooltip, table view)
+  js/redeem-ui.js     Redeem form shared by the owner and staff pages (code + purchase total -> after-deal price -> confirm)
+  js/consumer.js, business.js, admin.js, staff.js   One script per page
+tests/                engine.test.mjs (Node, in-memory store) and browser_e2e.py (Playwright + Chrome; serve docs/ on :8123 first)
+  sw.js, manifest*.webmanifest, icon*     PWA files. One manifest + icon per page (business/admin/staff) so each installs as its own home-screen icon
 worker/               Cloudflare Worker: index.js wraps engine.js and stores state in KV (binding LH_KV)
   worker-single-file.js   GENERATED paste-in copy (engine + seed + index). Regenerate after engine/seed changes.
   wrangler.toml
@@ -32,7 +38,7 @@ state in KV. Change a rule once, it changes everywhere. Never duplicate business
 pages only render and call the API.
 
 State is one JSON document (`emptyState()` in engine.js): businesses, deals, passes, events, loops, drops,
-subscribers, alerts, tips, rate. Logos are separate blobs (`logo:<bizId>`). A KV document is fine for a pilot;
+subscribers, alerts, tips, redemptions (the sales log: before/after amount, staff, location), staff, rate. Businesses may carry `locations` (extra shops), `resetNonce`, `pwChangedAt`; state may carry `adminCred` and `adminResetNonce`. Logos are separate blobs (`logo:<bizId>`). A KV document is fine for a pilot;
 the upgrade path is D1 or a Durable Object (only the store and load/save in `handle` change).
 
 ## Roles and auth
@@ -42,6 +48,14 @@ the upgrade path is D1 or a Durable Object (only the store and load/save in `han
   Bearer token (HMAC-signed, 12h) kept in localStorage. 5 failed logins per 15 min per email+IP.
 - **Admin:** username/password from Worker settings `ADMIN_USERNAME` / `ADMIN_PASSWORD`, default **Admin / Admin**
   (a red warning shows until both are set). Bearer token (8h) in sessionStorage. 5 failures per 15 min per IP.
+- **Staff:** invited by a business (QR / SMS link / email link; single-use token, 7 days). Accepting gives a 14-day
+  Bearer token (role `staff`) that stops working the moment staff is suspended/removed or the business is not approved.
+- **Password reset:** business `POST /api/business/forgot|reset`, admin `POST /api/admin/forgot|password-reset`. Links are
+  HMAC-signed, expire in 1 hour and carry a nonce that is cleared after use (single use; a new request voids older links).
+  The link host comes from `SITE_URL` (never from the request). Responses are the same whether the account exists or not.
+  Resetting invalidates older business tokens (`iat` < `pwChangedAt`). An admin reset stores `adminCred` in state, which
+  overrides `ADMIN_PASSWORD`. In demo mode the response includes `demoLink` because no email is sent.
+- **Back button:** every screen change goes through `nav.navigate()`; a sheet owns exactly one history entry.
 - All user text is escaped with `esc()` before it goes into `innerHTML`. Keep doing this.
 
 ## Business rules (all in engine.js)
@@ -92,7 +106,8 @@ close the account.
 
 ## Settings (Worker, not committed)
 
-`ADMIN_USERNAME`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `ALLOWED_ORIGIN`, `GOOGLE_MAPS_API_KEY`,
+`ADMIN_USERNAME`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `ALLOWED_ORIGIN`, `SITE_URL`, `RESEND_API_KEY`, `EMAIL_FROM`, `ADMIN_EMAIL`,
+`ANTHROPIC_API_KEY`, `AI_MODEL`, `GOOGLE_MAPS_API_KEY`,
 `GOOGLE_WALLET_ISSUER_ID`, `GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL`, `GOOGLE_WALLET_PRIVATE_KEY`, `ALLOW_SELF_UPGRADE`
 (testing only). Details in `guides/CLOUDFLARE_WORKER.md`. Never commit secrets.
 
@@ -107,13 +122,17 @@ close the account.
 - Single KV document (see above). Rate limits and events live in it too.
 - QR codes and map tiles load from CDNs (qrcode-generator on cdnjs, Leaflet on unpkg, CARTO tiles); offline they
   fall back to showing the code / a message. No Subresource Integrity hashes yet.
-- No camera scanning for redemption (type the code).
+- Camera QR scanning in redeem-ui uses the browser's BarcodeDetector (Chrome/Android, Safari 17+); untested on real devices. Typing the code always works.
+- Email (Resend) and the Claude-written "What to try next" were tested with a mock `fetch` only, never against the real services.
+- Limits that are my choices: Free 2 team members / 1 location, Pro 15 / 10; spotted deals live 30 days; reset links 1 hour.
+- Redemption math: % off, $ off and bundle are exact; BOGO is estimated as half the purchase and free-item as purchase minus the item value unless the staff member types the amount actually charged.
+- Spotted deals: the spotter gives a first name (required) and optional contact + consent; contact is only visible to admin.
 
 ## Conventions
 
 - No build tools, no frameworks, no npm packages. ES modules, `async/await`, template strings.
-- Phone first at 390px; dashboards use wider layouts from 900px. Dark mode follows the system.
+- Phone first at 390px; dashboards use wider layouts from 900px. Light/dark is chosen in Settings (Light / Dark / Automatic) via `data-theme` on `<html>`; every page has an inline head script so there is no flash.
 - After changing `engine.js` or `seed.js`, regenerate `worker/worker-single-file.js` (concatenate engine + seed +
   index, strip imports/exports) and bump `CACHE` in `docs/sw.js` when site files change.
-- Test: the engine runs in plain Node (`import { handle } from './docs/js/engine.js'`) with an in-memory store.
+- Test: `node tests/engine.test.mjs`; browser test: `cd docs && python3 -m http.server 8123` then `python3 tests/browser_e2e.py`.
 - Never leave TODO stubs.

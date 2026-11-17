@@ -3,7 +3,7 @@
  * Every demo business can sign in with password: demo1234
  * Example: owner@brewandbean.demo (Pro), owner@sunnybakery.demo (Free).
  */
-import { emptyState, hashPassword, DAY, HOUR, DEMO_CENTER } from './engine.js';
+import { emptyState, hashPassword, computeAfter, AVG_TICKET, DAY, HOUR, DEMO_CENTER } from './engine.js';
 
 export const DEMO_PASSWORD = 'demo1234';
 export const DEMO_LOGINS = [
@@ -118,9 +118,41 @@ export async function buildSeed(now) {
   ev(luigi.id, 'login', '', now - 5 * HOUR);
   ev(sunny.id, 'deal_edited', 'Free cookie with any coffee', now - 3 * DAY);
 
+  // Second location (Pro) and a team for Brew & Bean
+  brew.locations = [{ id: id('l'), name: 'Downtown', address: '200 Broad Street', ...at(0.008, 0.002), verified: false }];
+  const downtown = brew.locations[0].id;
+  const mkStaff = (o) => { const x = { id: id('s'), bizId: brew.id, method: 'qr', contact: '', status: 'accepted', locationId: 'main', createdAt: now - 40 * DAY, acceptedAt: now - 39 * DAY, invite: '', inviteExpiresAt: 0, ...o }; s.staff.push(x); return x; };
+  const jo = mkStaff({ name: 'Jo (morning shift)', method: 'qr' });
+  const kai = mkStaff({ name: 'Kai', method: 'sms', contact: '555 010 2233', locationId: downtown });
+  mkStaff({ name: 'Riley', method: 'email', contact: 'riley@example.com', status: 'invited', createdAt: now - 1 * DAY, acceptedAt: 0, invite: 'demoinviteriley0000001', inviteExpiresAt: now + 6 * DAY });
+  mkStaff({ name: 'Sasha', method: 'email', contact: 'sasha@example.com', status: 'suspended', createdAt: now - 60 * DAY, acceptedAt: now - 59 * DAY });
+  ev(brew.id, 'staff_invited', 'Jo (morning shift) (QR)', now - 40 * DAY);
+  ev(brew.id, 'staff_accepted', 'Jo (morning shift)', now - 39 * DAY);
+  ev(brew.id, 'staff_invited', 'Riley (EMAIL)', now - 1 * DAY);
+
+  // Redemption log built from the redeemed passes (before / after the deal, who rang it up, where)
+  let n = 0;
+  for (const p of s.passes) {
+    if (p.kind !== 'deal' || !p.stamps) continue;
+    const d = s.deals.find((x) => x.id === p.dealId);
+    const b = s.businesses.find((x) => x.id === p.bizId);
+    for (let k = 0; k < p.stamps; k++, n++) {
+      const calc = computeAfter(d, Math.round(AVG_TICKET[b.category] * (0.8 + (n % 7) * 0.12) * 100) / 100);
+      let staffId = '', locationId = 'main';
+      if (b.id === brew.id) {
+        const who = n % 4;
+        if (who === 1) staffId = jo.id;
+        if (who === 2) { staffId = kai.id; locationId = downtown; }
+        if (who === 3) locationId = downtown;
+      }
+      s.redemptions.push({ id: id('r'), bizId: b.id, dealId: d.id, passId: p.id, staffId, locationId, at: Math.min(now - HOUR, d.startsAt + ((n * 7) % 9) * 0.7 * DAY + 3 * HOUR), before: calc.before, after: calc.after, exact: calc.exact });
+    }
+  }
+
   s.tips.push(
-    { id: id('t'), consumerId: 'seed-consumer-1', name: 'Hot Pot House', address: '55 Pine Street', note: 'Lunch special: 20% off before 2pm', status: 'pending', at: now - 1 * DAY },
-    { id: id('t'), consumerId: 'seed-consumer-2', name: 'Fresh Cuts Barber', address: '4 Market Square', note: 'First haircut free for students on Mondays', status: 'approved', at: now - 4 * DAY },
+    { id: id('t'), consumerId: 'seed-consumer-1', name: 'Hot Pot House', address: '55 Pine Street', note: 'Lunch special: 20% off before 2pm', spotterName: 'Dana', contact: 'dana@example.com', consent: true, status: 'pending', at: now - 1 * DAY, approvedAt: 0 },
+    { id: id('t'), consumerId: 'seed-consumer-2', name: 'Fresh Cuts Barber', address: '4 Market Square', note: 'First haircut free for students on Mondays', spotterName: 'Marcus', contact: '', consent: false, status: 'approved', at: now - 4 * DAY, approvedAt: now - 3 * DAY },
+    { id: id('t'), consumerId: 'seed-consumer-3', name: 'Blue Door Yoga', address: '9 Birch Lane', note: 'Free community class on Sundays', spotterName: 'Priya', contact: '', consent: false, status: 'pending', at: now - 3 * HOUR, approvedAt: 0 },
   );
   s.events.sort((a, z) => a.at - z.at);
   return s;

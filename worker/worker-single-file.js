@@ -40,10 +40,12 @@ const CATEGORIES = [
 const CAT_IDS = CATEGORIES.map((c) => c.id);
 
 const LIMITS = {
-  free: { dealsPerMonth: 2, savesPerMonth: 50, dropsPerMonth: 0 },
-  pro: { dealsPerMonth: UNLIMITED, savesPerMonth: UNLIMITED, dropsPerMonth: 4 },
+  free: { dealsPerMonth: 2, savesPerMonth: 50, dropsPerMonth: 0, staff: 2, locations: 1 },
+  pro: { dealsPerMonth: UNLIMITED, savesPerMonth: UNLIMITED, dropsPerMonth: 4, staff: 15, locations: 10 },
 };
 const PILOT = { slots: 5, days: 60 };
+const TIP_LIFE = 30 * DAY; // a spotted deal stays live this long after approval
+const RESET_LIFE = HOUR; // password reset links work for 1 hour
 const PRICE = { monthly: 29, yearly: 290 };
 const DEAL_TYPES = ['percent', 'amount', 'bogo', 'freeitem', 'bundle'];
 const FREE_DEAL_TYPES = ['percent', 'amount'];
@@ -87,6 +89,15 @@ const EVENT_LABELS = {
   redeem: 'Redeemed a pass',
   profile_updated: 'Profile updated',
   logo_updated: 'Logo updated',
+  staff_invited: 'Team member invited',
+  staff_accepted: 'Team member accepted',
+  staff_suspended: 'Team member suspended',
+  staff_reinstated: 'Team member reinstated',
+  staff_removed: 'Team member removed',
+  location_added: 'Location added',
+  location_removed: 'Location removed',
+  password_reset_requested: 'Password reset requested',
+  password_reset: 'Password changed',
 };
 
 // ---------------------------------------------------------------- small helpers
@@ -134,6 +145,8 @@ function emptyState() {
     subscribers: [],
     alerts: [],
     tips: [],
+    redemptions: [],
+    staff: [],
     rate: {},
     secret: null,
   };
@@ -401,7 +414,8 @@ function logoShown(b, now) {
   return !!b.logoV && effectiveTier(b, now) === 'pro';
 }
 function bizPublic(b, now) {
-  return { id: b.id, name: b.name, category: b.category, emoji: b.emoji, address: b.address, lat: b.lat, lng: b.lng, blurb: b.blurb, hasLogo: logoShown(b, now), logoV: b.logoV };
+  return { id: b.id, name: b.name, category: b.category, emoji: b.emoji, address: b.address, lat: b.lat, lng: b.lng, blurb: b.blurb, hasLogo: logoShown(b, now), logoV: b.logoV,
+    locations: (b.locations || []).map((l) => ({ id: l.id, name: l.name, address: l.address, lat: l.lat, lng: l.lng })) };
 }
 function loopFor(state, d, now) {
   const l = state.loops.find((x) => x.fromDealId === d.id && x.status === 'active');
@@ -465,7 +479,7 @@ function bizPrivate(state, b, now) {
     tier: b.tier, effectiveTier: effectiveTier(b, now), pilotEndsAt: b.pilotEndsAt, status: b.status,
     signedUpAt: b.signedUpAt, approvedAt: b.approvedAt, lastLoginAt: b.lastLoginAt, closedAt: b.closedAt,
     hasLogo: !!b.logoV, logoV: b.logoV, logoShown: logoShown(b, now),
-    limits: limitsFor(b, now), usage: usage(state, b, now),
+    limits: limitsFor(b, now), usage: usage(state, b, now), locations: locationList(b),
   };
 }
 
@@ -579,6 +593,8 @@ async function handle(ctx0, req) {
   if (!state) state = ctx.autoSeed && ctx.seed ? await ctx.seed(now) : emptyState();
   ctx.secret = (ctx.env && ctx.env.SESSION_SECRET) || state.secret || (state.secret = rand(40));
   pruneRate(state, now);
+  state.redemptions ||= [];
+  state.staff ||= [];
   const c = { ctx, state, req, now, query: req.query || {}, body: req.body && typeof req.body === 'object' ? req.body : {} };
 
   for (const [method, pattern, fn] of ROUTES) {
@@ -603,7 +619,9 @@ async function authBiz(c) {
   const p = await readToken(c.ctx.secret, t, c.now);
   if (!p || p.role !== 'business') return null;
   const b = getBiz(c.state, p.id);
-  return b && b.status !== 'closed' ? b : null;
+  if (!b || b.status === 'closed') return null;
+  if (b.pwChangedAt && (p.iat || 0) < b.pwChangedAt) return null;
+  return b;
 }
 async function authAdmin(c) {
   const p = await readToken(c.ctx.secret, bearer(c.req), c.now);
@@ -641,7 +659,7 @@ async function routeDeals(c) {
     out.push(row);
   }
   out.sort((a, b) => (here ? a.distance - b.distance : b.startsAt - a.startsAt));
-  const tips = state.tips.filter((t) => t.status === 'approved').slice(-10).map((t) => ({ id: t.id, name: t.name, address: t.address, note: t.note }));
+  const tips = state.tips.filter((t) => tipIsLive(t, now)).slice(-10).map(tipPublic);
   return ok({ deals: out, tips });
 }
 
@@ -732,15 +750,6 @@ async function routeAlerts(c) {
   return ok({ alerts: list, notify: !!(sub && sub.notify) });
 }
 
-async function routeTip(c) {
-  const { state, body, now } = c;
-  const note = clean(body.note, 200);
-  const name = clean(body.name, 60);
-  if (name.length < 2 || note.length < 5) return err('Add the business name and a short note.');
-  if (hit(state, 'tip:' + ipOf(c), now, 10, HOUR)) return err('Too many tips. Please try again later.', 429);
-  state.tips.push({ id: uid('t'), consumerId: clean(body.consumerId, 60), name, address: clean(body.address, 120), note, status: 'pending', at: now });
-  return ok({ ok: true });
-}
 
 async function routeLogo(c) {
   const b = getBiz(c.state, c.params.id);
@@ -806,7 +815,7 @@ async function routeSignup(c) {
   const draft = makeConcierge(b, now);
   state.deals.push(draft);
   log(state, c.ctx, b.id, 'deal_created', `Suggested first deal: ${draft.title}`);
-  const token = await signToken(c.ctx.secret, { role: 'business', id: b.id, exp: now + 12 * HOUR });
+  const token = await signToken(c.ctx.secret, { role: 'business', id: b.id, iat: now, exp: now + 12 * HOUR });
   return ok({ token, business: bizPrivate(state, b, now) }, 201);
 }
 
@@ -826,7 +835,7 @@ async function routeLogin(c) {
   b.lastLoginAt = now;
   b.loginCount = (b.loginCount || 0) + 1;
   log(state, c.ctx, b.id, 'login', '');
-  const token = await signToken(c.ctx.secret, { role: 'business', id: b.id, exp: now + 12 * HOUR });
+  const token = await signToken(c.ctx.secret, { role: 'business', id: b.id, iat: now, exp: now + 12 * HOUR });
   return ok({ token, business: bizPrivate(state, b, now) });
 }
 
@@ -1026,48 +1035,6 @@ async function routeDealDelete(c) {
   return ok({ ok: true });
 }
 
-async function routeRedeem(c) {
-  const b = await authBiz(c);
-  if (!b) return NEED_LOGIN();
-  const { state, now } = c;
-  if (b.status !== 'approved') return err('Your account must be approved before you can redeem passes.');
-  const code = clean(c.body.code, 20).toUpperCase().replace(/^LH-/, '').replace(/[^A-Z0-9]/g, '');
-  const p = state.passes.find((x) => x.code === code && x.bizId === b.id);
-  if (!p) return err('No pass with that code was found for your business.', 404);
-  const d = p.dealId ? getDeal(state, p.dealId) : null;
-  const st = passStatus(p, d, b, now);
-  if (st !== 'active') return err(`This pass cannot be redeemed (${st}).`);
-  if (d && d.minSpend && !c.body.confirmMinSpend && p.stamps === 0) {
-    return err(`This deal needs a minimum spend of $${d.minSpend}. Confirm the customer met it, then redeem again.`, 409, { needsMinSpend: true });
-  }
-  p.stamps += 1;
-  p.lastRedeemAt = now;
-  let message;
-  if (p.kind === 'loop') {
-    message = `Loop reward redeemed: ${p.rewardText}.`;
-    alertTo(state, c.ctx, p.consumerId, 'redeem', 'Reward used', `${p.rewardText} at ${b.name}.`, { bizId: b.id });
-  } else {
-    const done = p.stamps >= d.stamps;
-    message = d.stamps > 1 ? `Stamp ${p.stamps} of ${d.stamps} added.${done ? ' Card complete!' : ''}` : 'Pass redeemed.';
-    alertTo(state, c.ctx, p.consumerId, 'redeem', d.stamps > 1 ? `Stamp ${p.stamps} of ${d.stamps}` : 'Pass redeemed', `${d.title} at ${b.name}.`, { dealId: d.id, bizId: b.id });
-    // Loop-In: first redemption earns the partner reward.
-    const loop = state.loops.find((l) => l.fromDealId === d.id && l.status === 'active');
-    if (loop && p.stamps === 1 && !state.passes.some((x) => x.sourcePassId === p.id)) {
-      const partner = getBiz(state, loop.toBizId);
-      if (partner && partner.status === 'approved') {
-        state.passes.push({
-          id: uid('p'), code: makeCode(), referralCode: '', kind: 'loop', dealId: null, bizId: partner.id, consumerId: p.consumerId,
-          loopId: loop.id, sourcePassId: p.id, rewardText: loop.rewardText, createdAt: now, expiresAt: now + 14 * DAY, stamps: 0, friendSaves: 0, lastRedeemAt: 0,
-        });
-        alertTo(state, c.ctx, p.consumerId, 'loop', `Loop reward unlocked at ${partner.name}`, `${loop.rewardText}. It is in your wallet for 14 days.`, { bizId: partner.id });
-        message += ` The customer also earned a reward at ${partner.name}.`;
-      }
-    }
-  }
-  log(state, c.ctx, b.id, 'redeem', d ? d.title : `Loop reward: ${p.rewardText}`);
-  return ok({ ok: true, message });
-}
-
 async function routeDrop(c) {
   const b = await authBiz(c);
   if (!b) return NEED_LOGIN();
@@ -1150,52 +1117,6 @@ async function routeLoopRespond(c) {
   return ok({ loop: loopView(c.state, l, c.now) });
 }
 
-async function routeAnalytics(c) {
-  const b = await authBiz(c);
-  if (!b) return NEED_LOGIN();
-  const { state, now } = c;
-  const pro = effectiveTier(b, now) === 'pro';
-  const mine = state.deals.filter((d) => d.bizId === b.id && d.status !== 'draft');
-  const rows = mine.map((d) => {
-    const m = dealMetrics(state, d);
-    return {
-      id: d.id, title: d.title, type: d.type, label: dealLabel(d), status: d.status, startsAt: d.startsAt, endsAt: d.endsAt,
-      past: d.status === 'ended' || now >= d.endsAt, ...m,
-      saveRate: m.views ? m.saves / m.views : 0, redeemRate: m.saves ? m.redemptions / m.saves : 0, revenue: Math.round(m.redemptions * AVG_TICKET[b.category]),
-    };
-  }).sort((a, z) => z.startsAt - a.startsAt);
-  const sum = (k) => rows.reduce((n, r) => n + r[k], 0);
-  const totals = { views: sum('views'), saves: sum('saves'), shares: sum('shares'), redemptions: sum('redemptions'), revenue: sum('revenue') };
-  if (!pro) return ok({ locked: true, totals });
-
-  const rate = (n, dn) => (dn ? n / dn : 0);
-  const mineRates = { saveRate: rate(totals.saves, totals.views), redeemRate: rate(totals.redemptions, totals.saves), shareRate: rate(totals.shares, totals.saves) };
-  const peers = state.businesses.filter((x) => x.id !== b.id && x.category === b.category && x.status === 'approved');
-  let pv = 0, ps = 0, pr = 0;
-  for (const x of peers) for (const d of state.deals.filter((q) => q.bizId === x.id && q.status !== 'draft')) {
-    const m = dealMetrics(state, d); pv += m.views; ps += m.saves; pr += m.redemptions;
-  }
-  const bench = peers.length >= 2 && pv >= 50
-    ? { source: 'platform', sample: peers.length, saveRate: rate(ps, pv), redeemRate: rate(pr, ps) }
-    : { source: 'estimate', sample: peers.length, ...BENCH[b.category] };
-
-  const insights = [];
-  const ranked = rows.filter((r) => r.saves >= 5).sort((a, z) => z.redeemRate - a.redeemRate);
-  if (ranked.length) insights.push(`"${ranked[0].title}" is your best deal so far: ${(ranked[0].redeemRate * 100).toFixed(0)}% of people who saved it came in.`);
-  const byType = {};
-  for (const r of ranked) (byType[r.type] ||= []).push(r.redeemRate);
-  const types = Object.entries(byType).map(([t, a]) => [t, a.reduce((x, y) => x + y, 0) / a.length]).sort((a, z) => z[1] - a[1]);
-  if (types.length >= 2) insights.push(`${typeName(types[0][0])} deals bring people in the most for you (${(types[0][1] * 100).toFixed(0)}% redeemed).`);
-  if (totals.views >= 30) {
-    insights.push(mineRates.saveRate >= bench.saveRate
-      ? `Your save rate (${(mineRates.saveRate * 100).toFixed(0)}%) beats the ${(bench.saveRate * 100).toFixed(0)}% neighborhood benchmark.`
-      : `Your save rate (${(mineRates.saveRate * 100).toFixed(0)}%) is under the ${(bench.saveRate * 100).toFixed(0)}% benchmark. Try a stronger title or a bigger first offer.`);
-  }
-  if (totals.saves >= 10 && mineRates.redeemRate < bench.redeemRate) insights.push('Many people save but do not come in. Try a Pass Push reminder or a shorter deal window.');
-  if (!insights.length) insights.push('Run a few deals and we will show what works best.');
-  const best = ranked.length ? ranked[0].id : null;
-  return ok({ locked: false, totals, rates: mineRates, benchmark: bench, deals: rows.map((r) => ({ ...r, best: r.id === best })), insights });
-}
 function typeName(t) {
   return { percent: '% off', amount: '$ off', bogo: 'Buy-one-get-one', freeitem: 'Free item', bundle: 'Bundle' }[t] || t;
 }
@@ -1209,21 +1130,26 @@ async function routeAdminLogin(c) {
   const env = c.ctx.env || {};
   const user = env.ADMIN_USERNAME || 'Admin';
   const pass = env.ADMIN_PASSWORD || 'Admin';
-  const a = await sha256(String(body.username ?? '') + '\n' + String(body.password ?? ''));
-  const b = await sha256(user + '\n' + pass);
-  if (!safeEqual(a, b)) {
+  let okLogin;
+  if (state.adminCred) {
+    const h = (await hashPassword(String(body.password ?? ''), state.adminCred.salt)).hash;
+    okLogin = safeEqual(await sha256(String(body.username ?? '')), await sha256(user)) && safeEqual(h, state.adminCred.hash);
+  } else {
+    okLogin = safeEqual(await sha256(String(body.username ?? '') + '\n' + String(body.password ?? '')), await sha256(user + '\n' + pass));
+  }
+  if (!okLogin) {
     failure(state, key, now);
     c.dirty = true;
     return err('Username or password is not right.', 401);
   }
   clearFailures(state, key);
   const token = await signToken(c.ctx.secret, { role: 'admin', exp: now + 8 * HOUR });
-  return ok({ token, usingDefaults: !(env.ADMIN_USERNAME && env.ADMIN_PASSWORD) });
+  return ok({ token, usingDefaults: !state.adminCred && !(env.ADMIN_USERNAME && env.ADMIN_PASSWORD) });
 }
 async function routeAdminMe(c) {
   if (!(await authAdmin(c))) return NEED_LOGIN();
   const env = c.ctx.env || {};
-  return ok({ ok: true, usingDefaults: !(env.ADMIN_USERNAME && env.ADMIN_PASSWORD), mode: c.ctx.demo ? 'demo' : 'live', addressCheck: !!env.GOOGLE_MAPS_API_KEY });
+  return ok({ ok: true, usingDefaults: !c.state.adminCred && !(env.ADMIN_USERNAME && env.ADMIN_PASSWORD), mode: c.ctx.demo ? 'demo' : 'live', addressCheck: !!env.GOOGLE_MAPS_API_KEY });
 }
 
 function adminRow(state, b, now) {
@@ -1255,6 +1181,7 @@ async function routeAdminBusinesses(c) {
     if (text && !(r.name.toLowerCase().includes(text) || r.email.includes(text) || r.owner.toLowerCase().includes(text) || r.address.toLowerCase().includes(text))) return false;
     if (q.category && r.category !== q.category) return false;
     if (q.status && r.status !== q.status) return false;
+    if (q.awaiting === '1' && r.status !== 'pending') return false;
     if (q.plan === 'pilot' ? !r.pilot : q.plan && r.effectiveTier !== q.plan) return false;
     if (!Number.isNaN(sf) && r.signedUpAt < sf) return false;
     if (!Number.isNaN(st) && r.signedUpAt > st) return false;
@@ -1278,6 +1205,8 @@ async function routeAdminStats(c) {
     total: state.businesses.length, pending: by('pending'), approved: by('approved'), suspended: by('suspended'), closed: by('closed'),
     pro: state.businesses.filter((b) => b.tier === 'pro').length, pilot: state.businesses.filter((b) => isPilot(b, now)).length, pilotSlots: PILOT.slots,
     liveDeals: state.deals.filter((d) => isLive(d, getBiz(state, d.bizId), now)).length, passes: state.passes.length,
+    awaiting: by('pending'), spottedSuggested: state.tips.filter((t) => t.status === 'pending').length, spottedLive: state.tips.filter((t) => tipIsLive(t, now)).length,
+    spottedToday: state.tips.filter((t) => t.at >= now - (now % DAY)).length,
     tipsPending: state.tips.filter((t) => t.status === 'pending').length, upgradeRequests: state.businesses.filter((b) => adminRow(state, b, now).upgradeRequested).length,
   });
 }
@@ -1291,6 +1220,8 @@ async function routeAdminBusiness(c) {
     business: { ...adminRow(state, b, now), blurb: b.blurb, lat: b.lat, lng: b.lng, placeId: b.placeId, addressRaw: b.addressRaw, hasLogo: !!b.logoV, usage: usage(state, b, now) },
     deals: state.deals.filter((d) => d.bizId === b.id).sort((a, z) => z.createdAt - a.createdAt).map((d) => ownerDeal(state, d, now)),
     events: state.events.filter((e) => e.bizId === b.id).sort((a, z) => z.at - a.at).slice(0, 150),
+    team: staffRows(state, b),
+    locations: locationList(b),
     loops: state.loops.filter((l) => l.fromBizId === b.id || l.toBizId === b.id).map((l) => loopView(state, l, now)),
   });
 }
@@ -1362,19 +1293,6 @@ async function routeAdminPilot(c) {
   return ok({ slots: PILOT.slots, used: rows.filter((r) => r.pilot).length, rows });
 }
 
-async function routeAdminTips(c) {
-  if (!(await authAdmin(c))) return NEED_LOGIN();
-  return ok({ tips: c.state.tips.slice().sort((a, z) => z.at - a.at).slice(0, 100) });
-}
-async function routeAdminTip(c) {
-  if (!(await authAdmin(c))) return NEED_LOGIN();
-  const t = c.state.tips.find((x) => x.id === c.params.id);
-  if (!t) return err('Tip not found.', 404);
-  if (c.body.action !== 'approve' && c.body.action !== 'reject') return err('Unknown action.');
-  t.status = c.body.action === 'approve' ? 'approved' : 'rejected';
-  return ok({ tip: t });
-}
-
 async function routeAdminSeed(c) {
   if (!(await authAdmin(c))) return NEED_LOGIN();
   if (!c.ctx.seed) return err('Demo data is not available here.');
@@ -1391,6 +1309,559 @@ async function routeAdminReset(c) {
   for (const k of Object.keys(c.state)) delete c.state[k];
   Object.assign(c.state, emptyState(), { secret });
   return ok({ ok: true });
+}
+
+// ---------------------------------------------------------------- v5: email, locations, redemption math, staff
+
+const siteBase = (c) => String((c.ctx.env && c.ctx.env.SITE_URL) || c.ctx.siteBase || '').replace(/\/+$/, '');
+
+async function sendEmail(c, to, subject, text) {
+  const env = c.ctx.env || {};
+  if (!env.RESEND_API_KEY || !env.EMAIL_FROM || !to) return false;
+  try {
+    const f = c.ctx.fetch || fetch;
+    const res = await f('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + env.RESEND_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: env.EMAIL_FROM, to: [to], subject, text }),
+    });
+    return !!(res && res.ok);
+  } catch {
+    return false;
+  }
+}
+
+function locationList(b) {
+  const main = { id: 'main', name: 'Main location', address: b.address, lat: b.lat, lng: b.lng };
+  return [main, ...(b.locations || [])];
+}
+function locationName(b, id) {
+  const l = locationList(b).find((x) => x.id === id);
+  return l ? l.name : 'Main location';
+}
+const validLocation = (b, id) => !id || locationList(b).some((x) => x.id === id);
+
+// What the customer pays after the deal. Exact for % off, $ off and bundle price; an estimate for the rest.
+function computeAfter(d, before) {
+  const bf = Math.max(0, Math.round((Number(before) || 0) * 100) / 100);
+  let after = bf;
+  let exact = true;
+  if (d) {
+    const v = Number(d.value) || 0;
+    if (d.type === 'percent') after = bf * (1 - v / 100);
+    else if (d.type === 'amount') after = Math.max(0, bf - v);
+    else if (d.type === 'bogo') { after = bf / 2; exact = false; }
+    else if (d.type === 'freeitem') { after = Math.max(0, bf - v); exact = false; }
+    else if (d.type === 'bundle') { after = v > 0 && bf > v ? v : bf; }
+  }
+  return { before: bf, after: Math.round(after * 100) / 100, exact };
+}
+
+function sumRedemptions(list) {
+  return list.reduce((a, r) => ({ n: a.n + 1, before: a.before + r.before, after: a.after + r.after }), { n: 0, before: 0, after: 0 });
+}
+const money = (n) => Math.round(n * 100) / 100;
+
+function staffRows(state, b) {
+  const reds = state.redemptions.filter((r) => r.bizId === b.id);
+  const rows = state.staff.filter((s) => s.bizId === b.id && s.status !== 'removed').sort((a, z) => z.createdAt - a.createdAt).map((s) => {
+    const t = sumRedemptions(reds.filter((r) => r.staffId === s.id));
+    return {
+      id: s.id, name: s.name, contact: s.contact, method: s.method, status: s.status, locationId: s.locationId || 'main',
+      locationName: locationName(b, s.locationId || 'main'), createdAt: s.createdAt, acceptedAt: s.acceptedAt || 0,
+      inviteOpen: !!s.invite && s.inviteExpiresAt > Date.now(),
+      redemptions: t.n, before: money(t.before), after: money(t.after),
+    };
+  });
+  const o = sumRedemptions(reds.filter((r) => !r.staffId));
+  return { staff: rows, owner: { redemptions: o.n, before: money(o.before), after: money(o.after) } };
+}
+
+async function authStaff(c) {
+  const p = await readToken(c.ctx.secret, bearer(c.req), c.now);
+  if (!p || p.role !== 'staff') return null;
+  const s = c.state.staff.find((x) => x.id === p.id);
+  if (!s || s.status !== 'accepted') return null;
+  const b = getBiz(c.state, s.bizId);
+  return b && b.status === 'approved' ? { staff: s, biz: b } : null;
+}
+
+// ---------------------------------------------------------------- redeeming (owner and staff share this)
+
+async function doRedeem(c, biz, staff) {
+  const { state, now, body } = c;
+  if (biz.status !== 'approved') return err('This business must be approved before passes can be redeemed.');
+  const code = clean(body.code, 20).toUpperCase().replace(/^LH-/, '').replace(/[^A-Z0-9]/g, '');
+  const p = state.passes.find((x) => x.code === code && x.bizId === biz.id);
+  if (!p) return err('No pass with that code was found for this business.', 404);
+  const d = p.dealId ? getDeal(state, p.dealId) : null;
+  const st = passStatus(p, d, biz, now);
+  if (st !== 'active') return err(`This pass cannot be redeemed (${st}).`);
+
+  const isLoop = p.kind === 'loop';
+  let calc = null;
+  if (!isLoop) {
+    const raw = body.before;
+    if (raw === undefined || raw === null || raw === '' || !Number.isFinite(Number(raw)) || Number(raw) <= 0 || Number(raw) > 100000) {
+      return err('Enter the purchase total before the deal (for example 24.50).', 400, { needsAmount: true });
+    }
+    calc = computeAfter(d, raw);
+    if (body.after !== undefined && body.after !== null && body.after !== '') {
+      const a = Number(body.after);
+      if (!Number.isFinite(a) || a < 0 || a > calc.before) return err('The final amount must be between $0 and the purchase total.');
+      calc = { ...calc, after: Math.round(a * 100) / 100, exact: true, overridden: true };
+    }
+    if (d.minSpend && p.stamps === 0 && calc.before < d.minSpend) return err(`This deal needs a minimum spend of $${d.minSpend}. The purchase total is $${calc.before.toFixed(2)}.`, 409);
+  }
+  if (body.preview) return ok({ preview: true, deal: d ? { title: d.title, label: dealLabel(d), stamps: d.stamps, minSpend: d.minSpend } : null, pass: { stamps: p.stamps, kind: p.kind, rewardText: p.rewardText || '' }, ...(calc || {}) });
+
+  let locationId = clean(body.locationId, 40) || (staff && staff.locationId) || 'main';
+  if (!validLocation(biz, locationId)) locationId = 'main';
+  p.stamps += 1;
+  p.lastRedeemAt = now;
+  let message;
+  if (isLoop) {
+    message = `Loop reward redeemed: ${p.rewardText}.`;
+    alertTo(state, c.ctx, p.consumerId, 'redeem', 'Reward used', `${p.rewardText} at ${biz.name}.`, { bizId: biz.id });
+  } else {
+    const done = p.stamps >= d.stamps;
+    message = d.stamps > 1 ? `Stamp ${p.stamps} of ${d.stamps} added.${done ? ' Card complete!' : ''}` : 'Pass redeemed.';
+    message += ` Purchase $${calc.before.toFixed(2)}, after the deal $${calc.after.toFixed(2)}${calc.exact ? '' : ' (estimated)'}.`;
+    alertTo(state, c.ctx, p.consumerId, 'redeem', d.stamps > 1 ? `Stamp ${p.stamps} of ${d.stamps}` : 'Pass redeemed', `${d.title} at ${biz.name}.`, { dealId: d.id, bizId: biz.id });
+    const loop = state.loops.find((l) => l.fromDealId === d.id && l.status === 'active');
+    if (loop && p.stamps === 1 && !state.passes.some((x) => x.sourcePassId === p.id)) {
+      const partner = getBiz(state, loop.toBizId);
+      if (partner && partner.status === 'approved') {
+        state.passes.push({
+          id: uid('p'), code: makeCode(), referralCode: '', kind: 'loop', dealId: null, bizId: partner.id, consumerId: p.consumerId,
+          loopId: loop.id, sourcePassId: p.id, rewardText: loop.rewardText, createdAt: now, expiresAt: now + 14 * DAY, stamps: 0, friendSaves: 0, lastRedeemAt: 0,
+        });
+        alertTo(state, c.ctx, p.consumerId, 'loop', `Loop reward unlocked at ${partner.name}`, `${loop.rewardText}. It is in your wallet for 14 days.`, { bizId: partner.id });
+        message += ` The customer also earned a reward at ${partner.name}.`;
+      }
+    }
+    state.redemptions.push({
+      id: uid('r'), bizId: biz.id, dealId: d.id, passId: p.id, staffId: staff ? staff.id : '', locationId, at: now,
+      before: calc.before, after: calc.after, exact: calc.exact,
+    });
+    if (state.redemptions.length > 50000) state.redemptions.splice(0, state.redemptions.length - 50000);
+  }
+  log(state, c.ctx, biz.id, 'redeem', (d ? d.title : `Loop reward: ${p.rewardText}`) + (staff ? ` (by ${staff.name})` : ''));
+  return ok({ ok: true, message, ...(calc || {}) });
+}
+
+async function routeRedeem(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  return doRedeem(c, b, null);
+}
+async function routeStaffRedeem(c) {
+  const a = await authStaff(c);
+  if (!a) return NEED_LOGIN();
+  return doRedeem(c, a.biz, a.staff);
+}
+
+// ---------------------------------------------------------------- staff
+
+async function routeStaffList(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const lim = limitsFor(b, c.now);
+  const active = c.state.staff.filter((s) => s.bizId === b.id && s.status !== 'removed').length;
+  return ok({ ...staffRows(c.state, b), limit: lim.staff, used: active, locations: locationList(b) });
+}
+
+async function routeStaffInvite(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, body, now } = c;
+  if (b.status !== 'approved') return err('Your account must be approved before you can invite staff.');
+  const name = clean(body.name, 60);
+  const method = ['qr', 'email', 'sms'].includes(body.method) ? body.method : 'qr';
+  const contact = clean(body.contact, 120);
+  if (name.length < 2) return err('Enter the team member\'s name.');
+  if (method === 'email' && !validEmail(contact)) return err('Enter a valid email address.');
+  if (method === 'sms' && contact.replace(/\D/g, '').length < 7) return err('Enter a mobile phone number.');
+  const used = state.staff.filter((s) => s.bizId === b.id && s.status !== 'removed').length;
+  if (used >= limitsFor(b, now).staff) return err(`Your plan allows ${limitsFor(b, now).staff} team members.${effectiveTier(b, now) === 'free' ? ' Upgrade to Pro for more.' : ''}`);
+  const locationId = validLocation(b, body.locationId) ? clean(body.locationId, 40) || 'main' : 'main';
+  const s = {
+    id: uid('s'), bizId: b.id, name, method, contact, status: 'invited', locationId, createdAt: now, acceptedAt: 0,
+    invite: rand(20), inviteExpiresAt: now + 7 * DAY,
+  };
+  state.staff.push(s);
+  log(state, c.ctx, b.id, 'staff_invited', `${name} (${method.toUpperCase()})`);
+  const base = siteBase(c);
+  const path = 'staff.html?invite=' + s.invite;
+  let emailed = false;
+  if (method === 'email' && base) {
+    emailed = await sendEmail(c, contact, `${b.name} invited you to redeem LocalHints deals`,
+      `Hi ${name},\n\n${b.name} invited you to scan and redeem LocalHints passes.\nOpen this link on your phone to accept (valid 7 days, one use):\n${base}/${path}\n\nIf you were not expecting this, ignore this email.`);
+  }
+  return ok({ staff: staffRows(state, b).staff.find((x) => x.id === s.id), invitePath: path, inviteUrl: base ? `${base}/${path}` : '', emailed, businessName: b.name }, 201);
+}
+
+async function routeStaffAction(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, body, now } = c;
+  const s = state.staff.find((x) => x.id === c.params.id && x.bizId === b.id && x.status !== 'removed');
+  if (!s) return err('Team member not found.', 404);
+  const a = body.action;
+  if (a === 'suspend') {
+    if (s.status !== 'accepted') return err('Only accepted team members can be suspended.');
+    s.status = 'suspended';
+    log(state, c.ctx, b.id, 'staff_suspended', s.name);
+  } else if (a === 'reinstate') {
+    if (s.status !== 'suspended') return err('Only suspended team members can be reinstated.');
+    s.status = 'accepted';
+    log(state, c.ctx, b.id, 'staff_reinstated', s.name);
+  } else if (a === 'remove') {
+    s.status = 'removed'; s.invite = '';
+    log(state, c.ctx, b.id, 'staff_removed', s.name);
+  } else if (a === 'reinvite') {
+    if (s.status !== 'invited') return err('This person already accepted.');
+    s.invite = rand(20); s.inviteExpiresAt = now + 7 * DAY;
+    const base = siteBase(c);
+    const path = 'staff.html?invite=' + s.invite;
+    let emailed = false;
+    if (s.method === 'email' && base) emailed = await sendEmail(c, s.contact, `${b.name} invited you to redeem LocalHints deals`, `Hi ${s.name},\n\nHere is your new link (valid 7 days, one use):\n${base}/${path}`);
+    return ok({ staff: staffRows(state, b).staff.find((x) => x.id === s.id), invitePath: path, inviteUrl: base ? `${base}/${path}` : '', emailed, businessName: b.name });
+  } else if (a === 'location') {
+    if (!validLocation(b, body.locationId)) return err('Unknown location.');
+    s.locationId = clean(body.locationId, 40) || 'main';
+  } else return err('Unknown action.');
+  return ok({ ok: true });
+}
+
+async function routeStaffAccept(c) {
+  const { state, body, now } = c;
+  if (hit(state, 'accept:' + ipOf(c), now, 20, HOUR)) return err('Too many tries. Please wait a while.', 429);
+  const code = clean(body.invite, 40);
+  const s = code ? state.staff.find((x) => x.invite === code && x.status === 'invited') : null;
+  if (!s) return err('This invite is not valid anymore. Ask your manager for a new one.', 404);
+  if (s.inviteExpiresAt < now) return err('This invite expired. Ask your manager for a new one.', 410);
+  const b = getBiz(state, s.bizId);
+  if (!b || b.status !== 'approved') return err('This business is not active right now.');
+  if (body.preview) return ok({ preview: true, businessName: b.name, name: s.name });
+  const n = clean(body.name, 60);
+  if (n.length >= 2) s.name = n;
+  s.status = 'accepted'; s.acceptedAt = now; s.invite = '';
+  log(state, c.ctx, b.id, 'staff_accepted', s.name);
+  const token = await signToken(c.ctx.secret, { role: 'staff', id: s.id, exp: now + 14 * DAY });
+  return ok({ token, staff: { id: s.id, name: s.name }, business: { name: b.name, emoji: b.emoji } });
+}
+
+async function routeStaffMe(c) {
+  const a = await authStaff(c);
+  if (!a) return NEED_LOGIN();
+  const { state, now } = c;
+  const mine = state.redemptions.filter((r) => r.staffId === a.staff.id);
+  const today = sumRedemptions(mine.filter((r) => r.at >= now - (now % DAY)));
+  const all = sumRedemptions(mine);
+  return ok({
+    staff: { id: a.staff.id, name: a.staff.name, locationName: locationName(a.biz, a.staff.locationId || 'main') },
+    business: { name: a.biz.name, emoji: a.biz.emoji }, locations: locationList(a.biz),
+    today: { n: today.n }, total: { n: all.n },
+  });
+}
+
+// ---------------------------------------------------------------- locations (Pro)
+
+async function routeLocationAdd(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, body, now } = c;
+  if (effectiveTier(b, now) !== 'pro') return err('Multiple locations are part of Pro.', 403, { needsPro: true });
+  const list = b.locations || [];
+  if (list.length + 1 >= LIMITS.pro.locations) return err(`You can add up to ${LIMITS.pro.locations} locations.`);
+  const name = clean(body.name, 60);
+  const address = clean(body.address, 160);
+  if (name.length < 2) return err('Give the location a name, like "Downtown".');
+  if (address.length < 6) return err('Enter the location\'s street address.');
+  let lat, lng, formatted = address, verified = false;
+  const g = await geocode(c.ctx, address);
+  if (g.unavailable) {
+    lat = Number(body.lat); lng = Number(body.lng);
+    if (!isNum(lat) || !isNum(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return err('We need a map location. Tap "Use my current location" while you are there.');
+  } else if (!g.ok) return err(g.error);
+  else { ({ lat, lng } = g); formatted = g.formatted; verified = true; }
+  const loc = { id: uid('l'), name, address: formatted, lat, lng, verified };
+  b.locations = [...list, loc];
+  log(state, c.ctx, b.id, 'location_added', name);
+  return ok({ locations: locationList(b) }, 201);
+}
+async function routeLocationRemove(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const list = b.locations || [];
+  const loc = list.find((l) => l.id === c.params.id);
+  if (!loc) return err('Location not found.', 404);
+  b.locations = list.filter((l) => l.id !== loc.id);
+  for (const s of c.state.staff) if (s.bizId === b.id && s.locationId === loc.id) s.locationId = 'main';
+  log(c.state, c.ctx, b.id, 'location_removed', loc.name);
+  return ok({ locations: locationList(b) });
+}
+
+// ---------------------------------------------------------------- analytics (graphs) and advice
+
+const SERIES_DAYS = 30;
+function computeAnalytics(state, b, now) {
+  const pro = effectiveTier(b, now) === 'pro';
+  const reds = state.redemptions.filter((r) => r.bizId === b.id);
+  const mine = state.deals.filter((d) => d.bizId === b.id && d.status !== 'draft');
+  const rows = mine.map((d) => {
+    const m = dealMetrics(state, d);
+    const t = sumRedemptions(reds.filter((r) => r.dealId === d.id));
+    const logged = t.n > 0;
+    return {
+      id: d.id, title: d.title, type: d.type, label: dealLabel(d), status: d.status, startsAt: d.startsAt, endsAt: d.endsAt,
+      past: d.status === 'ended' || now >= d.endsAt, ...m,
+      saveRate: m.views ? m.saves / m.views : 0, redeemRate: m.saves ? m.redemptions / m.saves : 0,
+      before: money(t.before), after: money(t.after),
+      revenue: Math.round(logged ? t.after : m.redemptions * AVG_TICKET[b.category]), revenueEstimated: !logged,
+    };
+  }).sort((a, z) => z.startsAt - a.startsAt);
+  const sum = (k) => rows.reduce((n, r) => n + r[k], 0);
+  const totals = { views: sum('views'), saves: sum('saves'), shares: sum('shares'), redemptions: sum('redemptions'), revenue: sum('revenue'), before: money(sum('before')), after: money(sum('after')) };
+  return { pro, rows, totals, reds, mine };
+}
+
+function buildSeries(state, b, now, rows, reds) {
+  const end = now - (now % DAY);
+  const days = Array.from({ length: SERIES_DAYS }, (_, i) => end - (SERIES_DAYS - 1 - i) * DAY);
+  const idx = (t) => Math.floor((t - days[0]) / DAY);
+  const blank = () => Array(SERIES_DAYS).fill(0);
+  const perDeal = {};
+  for (const r of rows) perDeal[r.id] = { saves: blank(), redemptions: blank(), sales: blank() };
+  for (const p of state.passes) {
+    if (p.bizId !== b.id || p.kind !== 'deal' || !perDeal[p.dealId]) continue;
+    const i = idx(p.createdAt);
+    if (i >= 0 && i < SERIES_DAYS) perDeal[p.dealId].saves[i] += 1;
+  }
+  const perLocation = {};
+  for (const l of locationList(b)) perLocation[l.id] = { name: l.name, redemptions: blank(), sales: blank(), before: 0, after: 0, count: 0 };
+  for (const r of reds) {
+    const i = idx(r.at);
+    const L = perLocation[r.locationId] || perLocation.main;
+    L.before += r.before; L.after += r.after; L.count += 1;
+    if (i < 0 || i >= SERIES_DAYS) continue;
+    if (perDeal[r.dealId]) { perDeal[r.dealId].redemptions[i] += 1; perDeal[r.dealId].sales[i] += r.after; }
+    L.redemptions[i] += 1; L.sales[i] += r.after;
+  }
+  for (const k of Object.keys(perDeal)) perDeal[k].sales = perDeal[k].sales.map(money);
+  for (const k of Object.keys(perLocation)) { const L = perLocation[k]; L.sales = L.sales.map(money); L.before = money(L.before); L.after = money(L.after); }
+  return { days, perDeal, perLocation };
+}
+
+function makeInsights(rows, totals, mineRates, bench) {
+  const insights = [];
+  const ranked = rows.filter((r) => r.saves >= 5).sort((a, z) => z.redeemRate - a.redeemRate);
+  if (ranked.length) insights.push(`"${ranked[0].title}" is your best deal so far: ${(ranked[0].redeemRate * 100).toFixed(0)}% of people who saved it came in.`);
+  const byType = {};
+  for (const r of ranked) (byType[r.type] ||= []).push(r.redeemRate);
+  const types = Object.entries(byType).map(([t, a]) => [t, a.reduce((x, y) => x + y, 0) / a.length]).sort((a, z) => z[1] - a[1]);
+  if (types.length >= 2) insights.push(`${typeName(types[0][0])} deals bring people in the most for you (${(types[0][1] * 100).toFixed(0)}% redeemed).`);
+  if (totals.views >= 30) {
+    insights.push(mineRates.saveRate >= bench.saveRate
+      ? `Your save rate (${(mineRates.saveRate * 100).toFixed(0)}%) beats the ${(bench.saveRate * 100).toFixed(0)}% neighborhood benchmark.`
+      : `Your save rate (${(mineRates.saveRate * 100).toFixed(0)}%) is under the ${(bench.saveRate * 100).toFixed(0)}% benchmark. Try a stronger title or a bigger first offer.`);
+  }
+  if (totals.saves >= 10 && mineRates.redeemRate < bench.redeemRate) insights.push('Many people save but do not come in. Try a Pass Push reminder or a shorter deal window.');
+  if (!insights.length) insights.push('Run a few deals and we will show what works best.');
+  return { insights, best: ranked.length ? ranked[0].id : null };
+}
+
+async function routeAnalytics(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, now } = c;
+  const { pro, rows, totals, reds } = computeAnalytics(state, b, now);
+  if (!pro) return ok({ locked: true, totals: { ...totals } });
+
+  const rate = (n, dn) => (dn ? n / dn : 0);
+  const mineRates = { saveRate: rate(totals.saves, totals.views), redeemRate: rate(totals.redemptions, totals.saves), shareRate: rate(totals.shares, totals.saves) };
+  const peers = state.businesses.filter((x) => x.id !== b.id && x.category === b.category && x.status === 'approved');
+  let pv = 0, ps = 0, pr = 0;
+  for (const x of peers) for (const d of state.deals.filter((q) => q.bizId === x.id && q.status !== 'draft')) {
+    const m = dealMetrics(state, d); pv += m.views; ps += m.saves; pr += m.redemptions;
+  }
+  const bench = peers.length >= 2 && pv >= 50
+    ? { source: 'platform', sample: peers.length, saveRate: rate(ps, pv), redeemRate: rate(pr, ps) }
+    : { source: 'estimate', sample: peers.length, ...BENCH[b.category] };
+  const { insights, best } = makeInsights(rows, totals, mineRates, bench);
+  return ok({
+    locked: false, totals, rates: mineRates, benchmark: bench, deals: rows.map((r) => ({ ...r, best: r.id === best })), insights,
+    series: buildSeries(state, b, now, rows, reds), locations: locationList(b), aiAvailable: !!(c.ctx.env && c.ctx.env.ANTHROPIC_API_KEY),
+  });
+}
+
+// "What to try next": rule-based tips always work. If ANTHROPIC_API_KEY is set (Worker secret), Claude writes
+// the advice from the business's aggregated numbers only. Pro only, cached for 24 hours.
+async function routeAdvice(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, now } = c;
+  const { pro, rows, totals } = computeAnalytics(state, b, now);
+  if (!pro) return err('What to try next is part of Pro.', 403, { needsPro: true });
+  const env = c.ctx.env || {};
+  const rules = [];
+  const ranked = rows.filter((r) => r.saves >= 5).sort((a, z) => z.redeemRate - a.redeemRate);
+  if (ranked.length) rules.push(`Run more deals like "${ranked[0].title}". It converts best for you.`);
+  if (totals.saves >= 10 && totals.redemptions / Math.max(1, totals.saves) < 0.3) rules.push('Send a Pass Push reminder two days before each deal ends.');
+  if (!rows.some((r) => r.status === 'live')) rules.push('You have no live deal. Publish one so shoppers nearby can save it.');
+  if (!rules.length) rules.push('Publish a few deals and we will show what works best.');
+  if (!env.ANTHROPIC_API_KEY) return ok({ source: 'rules', tips: rules });
+  if (b.advice && b.advice.at > now - DAY && !c.body.refresh) return ok({ source: 'ai', tips: b.advice.tips, cached: true });
+  try {
+    const f = c.ctx.fetch || fetch;
+    const summary = {
+      category: b.category, totals: { views: totals.views, saves: totals.saves, redemptions: totals.redemptions, salesAfterDeals: totals.after },
+      deals: rows.slice(0, 8).map((r) => ({ title: r.title, type: r.type, views: r.views, saves: r.saves, redemptions: r.redemptions, status: r.status })),
+    };
+    const res = await f('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: env.AI_MODEL || 'claude-haiku-5-5', max_tokens: 500,
+        system: 'You advise small local businesses using a coupon wallet. Reply with 3 short, concrete, friendly tips, one per line, no numbering, no markdown. Use only the numbers given.',
+        messages: [{ role: 'user', content: 'Here are my last results as JSON. What should I try next?\n' + JSON.stringify(summary) }],
+      }),
+    });
+    if (!res.ok) return ok({ source: 'rules', tips: rules });
+    const data = await res.json();
+    const text = (data.content || []).map((x) => x.text || '').join('\n');
+    const tips = text.split('\n').map((s) => clean(s.replace(/^[-*\d.\s]+/, ''), 220)).filter(Boolean).slice(0, 4);
+    if (!tips.length) return ok({ source: 'rules', tips: rules });
+    b.advice = { at: now, tips };
+    return ok({ source: 'ai', tips });
+  } catch {
+    return ok({ source: 'rules', tips: rules });
+  }
+}
+
+// ---------------------------------------------------------------- password reset
+
+async function makeResetLink(c, kind, id, nonce, path) {
+  const token = await signToken(c.ctx.secret, { role: 'reset', kind, id, n: nonce, exp: c.now + RESET_LIFE });
+  const base = siteBase(c);
+  return { token, url: base ? `${base}/${path}?reset=${token}` : '' };
+}
+const RESET_GENERIC = 'If that account exists, a link to choose a new password is on its way. It works for 1 hour.';
+
+async function routeBizForgot(c) {
+  const { state, body, now } = c;
+  if (hit(state, 'forgot:' + ipOf(c), now, 6, HOUR)) return err('Too many requests. Please try again later.', 429);
+  const email = clean(body.email, 120).toLowerCase();
+  const b = validEmail(email) ? state.businesses.find((x) => x.email === email && x.status !== 'closed') : null;
+  const out = { ok: true, message: RESET_GENERIC };
+  if (b) {
+    b.resetNonce = rand(10);
+    const link = await makeResetLink(c, 'business', b.id, b.resetNonce, 'business.html');
+    log(state, c.ctx, b.id, 'password_reset_requested', '');
+    const sent = link.url ? await sendEmail(c, b.email, 'Reset your LocalHints password', `Hi ${b.ownerName},\n\nChoose a new password here (valid for 1 hour, one use):\n${link.url}\n\nIf you did not ask for this, ignore this email.`) : false;
+    if (c.ctx.demo) { out.demoLink = link.url || `business.html?reset=${link.token}`; out.message = 'Demo mode: no email is sent. Use the link below.'; }
+    else if (!sent) console.error('reset email not sent: set SITE_URL, RESEND_API_KEY and EMAIL_FROM');
+  }
+  return ok(out);
+}
+async function routeBizReset(c) {
+  const { state, body, now } = c;
+  if (hit(state, 'reset:' + ipOf(c), now, 15, HOUR)) return err('Too many tries. Please wait a while.', 429);
+  const p = await readToken(c.ctx.secret, clean(body.token, 600), now);
+  const b = p && p.role === 'reset' && p.kind === 'business' ? getBiz(state, p.id) : null;
+  if (!b || !b.resetNonce || b.resetNonce !== p.n) return err('This link is not valid anymore. Ask for a new one.', 400);
+  const pw = passwordProblem(body.password);
+  if (pw) return err(pw);
+  const hp = await hashPassword(body.password);
+  b.passSalt = hp.salt; b.passHash = hp.hash; b.resetNonce = ''; b.pwChangedAt = now;
+  for (const k of Object.keys(state.rate)) if (k.startsWith('login:' + b.email + '|')) delete state.rate[k];
+  log(state, c.ctx, b.id, 'password_reset', '');
+  return ok({ ok: true });
+}
+async function routeAdminForgot(c) {
+  const { state, now } = c;
+  if (hit(state, 'aforgot:' + ipOf(c), now, 4, HOUR)) return err('Too many requests. Please try again later.', 429);
+  const env = c.ctx.env || {};
+  const out = { ok: true, message: RESET_GENERIC };
+  if (env.ADMIN_EMAIL || c.ctx.demo) {
+    state.adminResetNonce = rand(10);
+    const link = await makeResetLink(c, 'admin', 'admin', state.adminResetNonce, 'admin.html');
+    const sent = link.url && env.ADMIN_EMAIL ? await sendEmail(c, env.ADMIN_EMAIL, 'Reset the LocalHints admin password', `Choose a new admin password here (valid for 1 hour, one use):\n${link.url}\n\nIf you did not ask for this, ignore this email.`) : false;
+    if (c.ctx.demo) { out.demoLink = link.url || `admin.html?reset=${link.token}`; out.message = 'Demo mode: no email is sent. Use the link below.'; }
+    else if (!sent) console.error('admin reset email not sent: set ADMIN_EMAIL, SITE_URL, RESEND_API_KEY and EMAIL_FROM');
+  }
+  return ok(out);
+}
+async function routeAdminPasswordReset(c) {
+  const { state, body, now } = c;
+  if (hit(state, 'areset:' + ipOf(c), now, 15, HOUR)) return err('Too many tries. Please wait a while.', 429);
+  const p = await readToken(c.ctx.secret, clean(body.token, 600), now);
+  if (!p || p.role !== 'reset' || p.kind !== 'admin' || !state.adminResetNonce || p.n !== state.adminResetNonce) return err('This link is not valid anymore. Ask for a new one.', 400);
+  const pw = passwordProblem(body.password);
+  if (pw) return err(pw);
+  const hp = await hashPassword(body.password);
+  state.adminCred = { salt: hp.salt, hash: hp.hash, at: now };
+  state.adminResetNonce = '';
+  clearFailures(state, 'admin:' + ipOf(c));
+  return ok({ ok: true });
+}
+
+// ---------------------------------------------------------------- admin lists
+
+async function routeAdminDeals(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const { state, now, query: q } = c;
+  const list = state.deals.filter((d) => {
+    const b = getBiz(state, d.bizId);
+    if (!b) return false;
+    return q.live === '1' ? isLive(d, b, now) : true;
+  }).sort((a, z) => z.startsAt - a.startsAt).slice(0, 300).map((d) => {
+    const b = getBiz(state, d.bizId);
+    return { id: d.id, title: d.title, label: dealLabel(d), status: d.status, live: isLive(d, b, now), startsAt: d.startsAt, endsAt: d.endsAt, bizId: b.id, bizName: b.name, emoji: b.emoji };
+  });
+  return ok({ deals: list });
+}
+
+const tipIsLive = (t, now) => t.status === 'approved' && (t.approvedAt || t.at) + TIP_LIFE > now;
+function tipPublic(t) {
+  return { id: t.id, name: t.name, address: t.address, note: t.note, spotter: t.spotterName || 'A neighbor', spottedAt: t.at };
+}
+async function routeTip(c) {
+  const { state, body, now } = c;
+  const note = clean(body.note, 200);
+  const name = clean(body.name, 60);
+  const spotterName = clean(body.spotterName, 40);
+  const contact = clean(body.contact, 120);
+  if (name.length < 2 || note.length < 5) return err('Add the business name and a short note.');
+  if (spotterName.length < 2) return err('Add your first name so neighbors know who spotted it.');
+  if (contact) {
+    if (!body.consent) return err('Please tick the box to let us share your contact with the business, or leave the contact blank.');
+    if (!validEmail(contact) && contact.replace(/\D/g, '').length < 7) return err('Enter a valid email or phone, or leave it blank.');
+  }
+  if (hit(state, 'tip:' + ipOf(c), now, 10, HOUR)) return err('Too many tips. Please try again later.', 429);
+  state.tips.push({
+    id: uid('t'), consumerId: clean(body.consumerId, 60), name, address: clean(body.address, 120), note, spotterName,
+    contact, consent: !!contact && !!body.consent, status: 'pending', at: now, approvedAt: 0,
+  });
+  return ok({ ok: true });
+}
+async function routeAdminTips(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const { state, now, query: q } = c;
+  let list = state.tips.slice();
+  if (q.status) list = list.filter((t) => t.status === q.status);
+  if (q.live === '1') list = list.filter((t) => tipIsLive(t, now));
+  return ok({ tips: list.sort((a, z) => z.at - a.at).slice(0, 100).map((t) => ({ ...t, live: tipIsLive(t, now) })) });
+}
+async function routeAdminTip(c) {
+  if (!(await authAdmin(c))) return NEED_LOGIN();
+  const t = c.state.tips.find((x) => x.id === c.params.id);
+  if (!t) return err('Tip not found.', 404);
+  if (c.body.action !== 'approve' && c.body.action !== 'reject') return err('Unknown action.');
+  t.status = c.body.action === 'approve' ? 'approved' : 'rejected';
+  t.approvedAt = t.status === 'approved' ? c.now : 0;
+  return ok({ tip: t });
 }
 
 const ROUTES = [
@@ -1420,12 +1891,26 @@ const ROUTES = [
   ['POST', '/api/business/deals/:id/status', routeDealStatus],
   ['POST', '/api/business/deals/:id/delete', routeDealDelete],
   ['POST', '/api/business/redeem', routeRedeem],
+  ['POST', '/api/business/forgot', routeBizForgot],
+  ['POST', '/api/business/reset', routeBizReset],
+  ['GET', '/api/business/staff', routeStaffList],
+  ['POST', '/api/business/staff', routeStaffInvite],
+  ['POST', '/api/business/staff/:id', routeStaffAction],
+  ['POST', '/api/business/locations', routeLocationAdd],
+  ['POST', '/api/business/locations/:id/remove', routeLocationRemove],
+  ['POST', '/api/business/advice', routeAdvice],
+  ['POST', '/api/staff/accept', routeStaffAccept],
+  ['GET', '/api/staff/me', routeStaffMe],
+  ['POST', '/api/staff/redeem', routeStaffRedeem],
   ['POST', '/api/business/drop', routeDrop],
   ['POST', '/api/business/push', routePush],
   ['POST', '/api/business/loops', routeLoopPropose],
   ['POST', '/api/business/loops/:id', routeLoopRespond],
   ['GET', '/api/business/analytics', routeAnalytics],
   ['POST', '/api/admin/login', routeAdminLogin],
+  ['POST', '/api/admin/forgot', routeAdminForgot],
+  ['POST', '/api/admin/password-reset', routeAdminPasswordReset],
+  ['GET', '/api/admin/deals', routeAdminDeals],
   ['GET', '/api/admin/me', routeAdminMe],
   ['GET', '/api/admin/stats', routeAdminStats],
   ['GET', '/api/admin/businesses', routeAdminBusinesses],
@@ -1559,15 +2044,47 @@ async function buildSeed(now) {
   ev(luigi.id, 'login', '', now - 5 * HOUR);
   ev(sunny.id, 'deal_edited', 'Free cookie with any coffee', now - 3 * DAY);
 
+  // Second location (Pro) and a team for Brew & Bean
+  brew.locations = [{ id: id('l'), name: 'Downtown', address: '200 Broad Street', ...at(0.008, 0.002), verified: false }];
+  const downtown = brew.locations[0].id;
+  const mkStaff = (o) => { const x = { id: id('s'), bizId: brew.id, method: 'qr', contact: '', status: 'accepted', locationId: 'main', createdAt: now - 40 * DAY, acceptedAt: now - 39 * DAY, invite: '', inviteExpiresAt: 0, ...o }; s.staff.push(x); return x; };
+  const jo = mkStaff({ name: 'Jo (morning shift)', method: 'qr' });
+  const kai = mkStaff({ name: 'Kai', method: 'sms', contact: '555 010 2233', locationId: downtown });
+  mkStaff({ name: 'Riley', method: 'email', contact: 'riley@example.com', status: 'invited', createdAt: now - 1 * DAY, acceptedAt: 0, invite: 'demoinviteriley0000001', inviteExpiresAt: now + 6 * DAY });
+  mkStaff({ name: 'Sasha', method: 'email', contact: 'sasha@example.com', status: 'suspended', createdAt: now - 60 * DAY, acceptedAt: now - 59 * DAY });
+  ev(brew.id, 'staff_invited', 'Jo (morning shift) (QR)', now - 40 * DAY);
+  ev(brew.id, 'staff_accepted', 'Jo (morning shift)', now - 39 * DAY);
+  ev(brew.id, 'staff_invited', 'Riley (EMAIL)', now - 1 * DAY);
+
+  // Redemption log built from the redeemed passes (before / after the deal, who rang it up, where)
+  let n = 0;
+  for (const p of s.passes) {
+    if (p.kind !== 'deal' || !p.stamps) continue;
+    const d = s.deals.find((x) => x.id === p.dealId);
+    const b = s.businesses.find((x) => x.id === p.bizId);
+    for (let k = 0; k < p.stamps; k++, n++) {
+      const calc = computeAfter(d, Math.round(AVG_TICKET[b.category] * (0.8 + (n % 7) * 0.12) * 100) / 100);
+      let staffId = '', locationId = 'main';
+      if (b.id === brew.id) {
+        const who = n % 4;
+        if (who === 1) staffId = jo.id;
+        if (who === 2) { staffId = kai.id; locationId = downtown; }
+        if (who === 3) locationId = downtown;
+      }
+      s.redemptions.push({ id: id('r'), bizId: b.id, dealId: d.id, passId: p.id, staffId, locationId, at: Math.min(now - HOUR, d.startsAt + ((n * 7) % 9) * 0.7 * DAY + 3 * HOUR), before: calc.before, after: calc.after, exact: calc.exact });
+    }
+  }
+
   s.tips.push(
-    { id: id('t'), consumerId: 'seed-consumer-1', name: 'Hot Pot House', address: '55 Pine Street', note: 'Lunch special: 20% off before 2pm', status: 'pending', at: now - 1 * DAY },
-    { id: id('t'), consumerId: 'seed-consumer-2', name: 'Fresh Cuts Barber', address: '4 Market Square', note: 'First haircut free for students on Mondays', status: 'approved', at: now - 4 * DAY },
+    { id: id('t'), consumerId: 'seed-consumer-1', name: 'Hot Pot House', address: '55 Pine Street', note: 'Lunch special: 20% off before 2pm', spotterName: 'Dana', contact: 'dana@example.com', consent: true, status: 'pending', at: now - 1 * DAY, approvedAt: 0 },
+    { id: id('t'), consumerId: 'seed-consumer-2', name: 'Fresh Cuts Barber', address: '4 Market Square', note: 'First haircut free for students on Mondays', spotterName: 'Marcus', contact: '', consent: false, status: 'approved', at: now - 4 * DAY, approvedAt: now - 3 * DAY },
+    { id: id('t'), consumerId: 'seed-consumer-3', name: 'Blue Door Yoga', address: '9 Birch Lane', note: 'Free community class on Sundays', spotterName: 'Priya', contact: '', consent: false, status: 'pending', at: now - 3 * HOUR, approvedAt: 0 },
   );
   s.events.sort((a, z) => a.at - z.at);
   return s;
 }
 
-// ===== index.js =====
+// ===== worker/index.js =====
 /*
  * LocalHints Cloudflare Worker.
  * A thin wrapper: it receives HTTP requests, hands them to the shared engine
@@ -1581,6 +2098,10 @@ async function buildSeed(now) {
  *   GOOGLE_WALLET_ISSUER_ID, GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL, GOOGLE_WALLET_PRIVATE_KEY
  *                                    turns on "Save to Google Wallet"
  *   ALLOW_SELF_UPGRADE               "true" lets businesses switch to Pro themselves (testing only)
+ *   SITE_URL                         your website address, e.g. https://yourname.github.io/localhints (used in reset and invite links)
+ *   RESEND_API_KEY, EMAIL_FROM       turns on sending email (password reset, team invites) through Resend
+ *   ADMIN_EMAIL                      where the admin "Forgot password" link is sent
+ *   ANTHROPIC_API_KEY, AI_MODEL      optional: lets "What to try next" use Claude (AI_MODEL defaults to claude-haiku-5-5)
  */
 
 const STATE_KEY = 'state';

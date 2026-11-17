@@ -39,7 +39,7 @@ const localStore = {
 
 async function local(method, path, query, body, token) {
   const r = await handle(
-    { store: localStore, env: {}, demo: true, seed: buildSeed, autoSeed: true, fetch: null, origin: location.origin },
+    { store: localStore, env: {}, demo: true, seed: buildSeed, autoSeed: true, fetch: null, origin: location.origin, siteBase: location.origin + location.pathname.replace(/[^/]*$/, '') },
     { method, path, query, body, headers: token ? { authorization: 'Bearer ' + token } : {}, ip: 'browser' },
   );
   return r;

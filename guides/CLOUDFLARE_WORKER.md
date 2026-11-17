@@ -13,6 +13,10 @@ Cloudflare KV namespace bound as `LH_KV`.
 | `GOOGLE_MAPS_API_KEY` | Turns on Google address verification (Geocoding API). Restrict the key to the Geocoding API. | For address check |
 | `GOOGLE_WALLET_ISSUER_ID`, `GOOGLE_WALLET_SERVICE_ACCOUNT_EMAIL`, `GOOGLE_WALLET_PRIVATE_KEY` | Turns on "Save to Google Wallet". The private key is the PEM from the service account JSON (keep the `\n` characters). | For Google Wallet |
 | `APPLE_PASS_TYPE_ID`, `APPLE_TEAM_ID`, `APPLE_WEB_SERVICE_URL` | Used in the Apple pass data. Signing the `.pkpass` is not built in yet. | Later |
+| `SITE_URL` | Your website address including the folder, e.g. `https://yourname.github.io/localhints`. Used to build password-reset and team-invite links. | For reset/invite emails |
+| `RESEND_API_KEY`, `EMAIL_FROM` | Sends email through Resend (resend.com). `EMAIL_FROM` is like `LocalHints <hello@yourdomain.com>` on a domain you verified there. Without these, reset emails are not sent. | For email |
+| `ADMIN_EMAIL` | Where the admin "Forgot password" link goes. | For admin reset |
+| `ANTHROPIC_API_KEY`, `AI_MODEL` | Optional. Lets "What to try next" use Claude (Pro businesses, cached 24h, only totals are sent). `AI_MODEL` defaults to `claude-haiku-5-5`. | No |
 | `ALLOW_SELF_UPGRADE` | `true` lets businesses switch themselves to Pro. For testing only. Otherwise an upgrade becomes a request the admin sees. | No |
 
 ## API summary
@@ -21,9 +25,11 @@ Public: `GET /api/health`, `GET /api/deals`, `POST /api/claim`, `GET /api/passes
 `POST /api/subscribe`, `GET /api/alerts`, `POST /api/tips`, `POST /api/address/verify`, `GET /api/logo/:businessId`.
 
 Business (Bearer token): `POST /api/business/signup | login | profile | logo | tier | close | deals | redeem | drop | push | loops`,
-`GET /api/business/me | partners | analytics`, `POST /api/business/deals/:id/{edit|publish|status|delete}`.
+`GET /api/business/me | partners | analytics | staff`, `POST /api/business/forgot | reset | advice | staff | staff/:id | locations | locations/:id/remove`, `POST /api/business/deals/:id/{edit|publish|status|delete}`.
 
-Admin (Bearer token): `POST /api/admin/login`, `GET /api/admin/{me|stats|businesses|businesses/:id|events|pilot|tips}`,
+Staff: `POST /api/staff/accept` (invite), then Bearer token: `GET /api/staff/me`, `POST /api/staff/redeem`.
+
+Admin (Bearer token): `POST /api/admin/login | forgot | password-reset`, `GET /api/admin/{me|stats|businesses|businesses/:id|deals|events|pilot|tips}`,
 `POST /api/admin/businesses/:id/action`, `POST /api/admin/{seed|reset}`.
 
 ## Limits to know about

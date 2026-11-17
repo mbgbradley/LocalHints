@@ -63,6 +63,15 @@ In the Worker: **Settings** → **Variables and Secrets** → **Add**. Add each 
 | `SESSION_SECRET` | A long mash of random letters and numbers (40+ characters) |
 | `ALLOWED_ORIGIN` | Your site, like `https://yourname.github.io` (no `/localhints` and no slash at the end) |
 
+Also add these (type **Text** is fine for the first two):
+
+| Name | What to put |
+|---|---|
+| `SITE_URL` | Your website address, like `https://yourname.github.io/localhints` (no slash at the end) |
+| `ADMIN_EMAIL` | Your own email, so "Forgot password" on the admin page can reach you |
+| `RESEND_API_KEY` and `EMAIL_FROM` | Optional but needed for emails. Make a free account at resend.com, verify a domain, make an API key. `EMAIL_FROM` looks like `LocalHints <hello@yourdomain.com>` |
+| `ANTHROPIC_API_KEY` | Optional. Lets "What to try next" ask Claude for ideas |
+
 Click **Deploy** after adding them.
 
 Check it worked: the old `Admin` / `Admin` login no longer works on the live site, and the red warning on the
@@ -118,6 +127,12 @@ signing step. Read `guides/WALLET_RADIUS_PUSH.md` first, then ask Claude: "Help 
 Right now, on the live site, tapping "Upgrade to Pro" sends a request that you see in Admin (a yellow
 "Wants Pro" tag). You switch them with **Change to Pro**. When you are ready for real payments, ask Claude to
 connect **Stripe**.
+
+## Your team and the home-screen icons
+
+- **Invite a clerk:** business page, **Team** tab, **Invite a team member**. Pick **QR code**, show your phone, and they scan it with their camera. They tap **Accept and join** and they are in. Text and email work too.
+- **Put a shortcut on your phone:** tap the little square-with-a-plus button at the top of any page (shoppers, business, admin, team). It shows the exact steps for your phone.
+- **Dark mode:** the sliders button at the top, then Light, Dark or Automatic.
 
 ## Staying safe
 

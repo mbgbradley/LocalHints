@@ -3,8 +3,9 @@ import { api, MODE, consumerId, ApiError } from './api.js';
 import { CATEGORIES, DEMO_CENTER } from './engine.js';
 import {
   esc, toast, openSheet, closeSheet, qrSvg, loadLeaflet, registerServiceWorker, getBrowserLocation, guard,
-  milesLabel, timeLeft, fmtDate, ago, avatar, catEmoji,
+  milesLabel, timeLeft, fmtDate, ago, avatar, catEmoji, icon, installButtonHtml, settingsButtonHtml, bindChrome,
 } from './ui.js';
+import { initNav, navigate } from './nav.js';
 
 const CID = consumerId();
 const S = {
@@ -40,34 +41,42 @@ const unseen = () => S.alerts.filter((a) => a.at > S.seen).length;
 
 // ---------------------------------------------------------------- shell
 
+const NAV = [['discover', 'home', 'Discover'], ['map', 'map', 'Map'], ['loop', 'loop', 'Loop'], ['wallet', 'wallet', 'Wallet'], ['alerts', 'bell', 'Alerts']];
 function shell() {
+  root.className = 'app-shell';
   root.innerHTML = `
     ${MODE === 'demo' ? '<div class="banner">Demo mode: sample shops, and everything you do stays in this browser.</div>' : ''}
     <header class="topbar"><div class="topbar-in">
       <a class="brand" href="index.html"><img src="icon.svg" alt="">LocalHints</a>
       <span class="grow"></span>
-      <button class="btn btn-sm" id="locBtn" aria-label="Change location">📍 ${esc(S.pos ? S.pos.label : 'Set location')}</button>
+      ${installButtonHtml()}
+      <button class="btn btn-sm" id="locBtn" aria-label="Change location">${icon('pin', 16)} ${esc(S.pos ? S.pos.label : 'Set location')}</button>
+      ${settingsButtonHtml()}
       <a class="btn btn-sm only-desktop" href="business.html">For business</a>
     </div></header>
-    <main class="page" id="view"></main>
+    <div class="scroller${S.tab === 'map' ? ' fit' : ''}" id="scroller"><main class="page" id="view"></main></div>
     <nav class="nav" aria-label="Main"><div class="nav-in">
-      ${[['discover', '🏠', 'Discover'], ['map', '🗺️', 'Map'], ['loop', '🔁', 'Loop'], ['wallet', '👛', 'Wallet'], ['alerts', '🔔', 'Alerts']]
-        .map(([id, ico, label]) => `<button data-tab="${id}" ${S.tab === id ? 'aria-current="page"' : ''}><span class="ico">${ico}</span>${label}${id === 'alerts' && unseen() ? `<span class="dot">${unseen()}</span>` : ''}</button>`).join('')}
+      ${NAV.map(([id, ico, label]) => `<button data-tab="${id}" ${S.tab === id ? 'aria-current="page"' : ''}><span class="ico">${icon(ico, 24)}</span>${label}${id === 'alerts' && unseen() ? `<span class="dot">${unseen()}</span>` : ''}</button>`).join('')}
     </div></nav>`;
   root.querySelector('#locBtn').onclick = locationSheet;
+  bindChrome(root, 'LocalHints');
   root.querySelectorAll('[data-tab]').forEach((b) => (b.onclick = () => go(b.dataset.tab)));
   render();
 }
+/** Tap on a nav button: remembered in history so the Back button returns to the previous screen. */
 function go(tab) {
-  S.tab = tab;
-  if (tab === 'alerts') {
+  if (tab === S.tab) { document.getElementById('scroller').scrollTop = 0; return; }
+  navigate({ tab });
+}
+function show(tab) {
+  S.tab = tab || 'discover';
+  if (S.tab === 'alerts') {
     S.seen = Date.now();
     safe('lh:alerts-seen', String(S.seen));
   }
   shell();
-  window.scrollTo(0, 0);
-  if (tab === 'wallet') loadPasses().then(() => S.tab === 'wallet' && render());
-  if (tab === 'alerts') loadAlerts().then(() => S.tab === 'alerts' && render());
+  if (S.tab === 'wallet') loadPasses().then(() => S.tab === 'wallet' && render());
+  if (S.tab === 'alerts') loadAlerts().then(() => S.tab === 'alerts' && render());
 }
 function render() {
   const v = document.getElementById('view');
@@ -140,7 +149,7 @@ function renderDiscover(v) {
   v.innerHTML = `<div class="hero"><h1>Deals near you</h1><p class="muted">Save a deal to your phone wallet and show it at the counter.</p></div>
     <div class="discover with-map mt">
       <div class="stack">${filterBar()}<div id="list" class="stack">${listHtml()}</div>
-        ${S.tips.length ? `<h3 class="section-title">Spotted by neighbors</h3>${S.tips.map((t) => `<div class="card flat small"><b>${esc(t.name)}</b>${t.address ? ' · ' + esc(t.address) : ''}<div class="muted">${esc(t.note)}</div></div>`).join('')}` : ''}
+        ${S.tips.length ? `<h3 class="section-title">Spotted by neighbors</h3>${S.tips.map((t) => `<div class="card flat small"><b>${esc(t.name)}</b>${t.address ? ' · ' + esc(t.address) : ''}<div class="muted">${esc(t.note)}</div><div class="tiny muted mt">Spotted by <b>${esc(t.spotter)}</b> · ${esc(ago(t.spottedAt))}</div></div>`).join('')}` : ''}
         <button class="btn btn-block" id="tipBtn">💡 Spot a deal we missed</button>
       </div>
       <div class="only-desktop"><div id="map"></div></div>
@@ -157,7 +166,7 @@ function destroyMap() {
   if (S.map) { S.map.remove(); S.map = null; S.layer = null; }
 }
 function renderMap(v) {
-  v.innerHTML = `<h1>Deal map</h1><p class="muted mt">Every deal around you. Tap a pin for details.</p><div class="mt">${filterBar()}</div><div id="map" class="mt"></div>`;
+  v.innerHTML = `<div class="row between"><h1>Deal map</h1><span class="small muted">Tap a pin for details</span></div><div class="mt">${filterBar()}</div><div id="map" class="mt"></div>`;
   bindFilters(v);
   initMap();
 }
@@ -192,8 +201,13 @@ function drawPins(fit) {
       html: `<div style="width:44px;height:44px;border-radius:50% 50% 50% 4px;transform:rotate(-45deg);background:${esc(ds[0].color)};box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;border:2px solid #fff"><span style="transform:rotate(45deg);font-size:20px">${esc(b.emoji)}</span></div>`,
     });
     const m = L.marker([b.lat, b.lng], { icon }).addTo(S.layer);
-    m.bindPopup(`<b>${esc(b.name)}</b><br>${ds.map((d) => `<a href="#" data-popdeal="${esc(d.id)}">${esc(d.label)}: ${esc(d.title)}</a>`).join('<br>')}`);
+    const popup = (where) => `<b>${esc(b.name)}</b>${where ? ' · ' + esc(where) : ''}<br>${ds.map((d) => `<a href="#" data-popdeal="${esc(d.id)}">${esc(d.label)}: ${esc(d.title)}</a>`).join('<br>')}`;
+    m.bindPopup(popup(b.locations && b.locations.length ? 'Main location' : ''));
     pts.push([b.lat, b.lng]);
+    for (const loc of b.locations || []) {
+      L.marker([loc.lat, loc.lng], { icon }).addTo(S.layer).bindPopup(popup(loc.name));
+      pts.push([loc.lat, loc.lng]);
+    }
   }
   if (S.pos) {
     L.circleMarker([S.pos.lat, S.pos.lng], { radius: 8, color: '#fff', weight: 3, fillColor: '#2563eb', fillOpacity: 1 }).addTo(S.layer).bindTooltip('You are here');
@@ -384,16 +398,29 @@ function locationSheet() {
   if (c) c.onclick = async () => { S.pos = null; safe('lh:pos', ''); try { localStorage.removeItem('lh:pos'); } catch { /* ignore */ } await done(); };
 }
 function tipSheet() {
-  const el = openSheet(`<h2>Spot a deal</h2><p class="muted mt">Tell us about a local deal. We will check it before showing it to neighbors.</p>
+  const me = safe('lh:spotter') || '';
+  const el = openSheet(`<h2>Spot a deal</h2><p class="muted mt">Tell us about a local deal. We check it before showing it to neighbors, and neighbors see your first name next to it.</p>
     <form class="stack mt-lg" id="f">
+      <label class="field"><span class="lbl">Your first name</span><input class="input" name="spotterName" required maxlength="40" autocomplete="given-name" value="${esc(me)}"></label>
       <label class="field"><span class="lbl">Business name</span><input class="input" name="name" required maxlength="60"></label>
       <label class="field"><span class="lbl">Address (optional)</span><input class="input" name="address" maxlength="120"></label>
       <label class="field"><span class="lbl">What is the deal?</span><textarea class="input" name="note" required maxlength="200"></textarea></label>
+      <label class="field"><span class="lbl">Email or phone (optional)</span><input class="input" name="contact" maxlength="120" autocomplete="email"></label>
+      <label class="check"><input type="checkbox" name="consent" value="1"> It is OK to share my name and this contact with the business, so they can say thanks and claim their listing.</label>
+      <p class="hint">Never shown to other shoppers. Leave it blank to stay anonymous apart from your first name.</p>
+      <div id="tipErr"></div>
       <button class="btn btn-primary btn-block">Send tip</button></form>`);
   el.querySelector('#f').onsubmit = (e) => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.target));
-    guard(e.target.querySelector('button'), async () => { await api.post('/api/tips', { ...f, consumerId: CID }); closeSheet(true); toast('Thanks! We will review it.'); });
+    guard(e.target.querySelector('button'), async () => {
+      try {
+        await api.post('/api/tips', { ...f, consent: !!f.consent, consumerId: CID });
+        safe('lh:spotter', f.spotterName);
+        closeSheet(true);
+        toast('Thanks! We will review it.');
+      } catch (ex) { el.querySelector('#tipErr').innerHTML = `<div class="err" role="alert">${esc(ex.message)}</div>`; }
+    });
   };
 }
 
@@ -401,6 +428,9 @@ function tipSheet() {
 
 async function boot() {
   registerServiceWorker();
+  const startTab = ['discover', 'map', 'loop', 'wallet', 'alerts'].includes(new URLSearchParams(location.search).get('tab')) ? new URLSearchParams(location.search).get('tab') : 'discover';
+  S.tab = startTab;
+  initNav({ tab: startTab }, (st) => show(st.tab));
   shell();
   try {
     S.health = await api.get('/api/health');

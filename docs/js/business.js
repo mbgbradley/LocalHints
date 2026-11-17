@@ -4,8 +4,11 @@ import { CATEGORIES, EVENT_LABELS, LIMITS, PILOT, PRICE, DEMO_CENTER, UNLIMITED 
 import { DEMO_LOGINS, DEMO_PASSWORD } from './seed.js';
 import {
   esc, toast, openSheet, closeSheet, confirmSheet, guard, fmtDate, fmtDateTime, ago, pct, money, dateInput, fromDateInput,
-  getBrowserLocation, registerServiceWorker, avatar, catLabel, timeLeft,
+  getBrowserLocation, registerServiceWorker, avatar, catLabel, timeLeft, qrSvg, installButtonHtml, settingsButtonHtml, bindChrome,
 } from './ui.js';
+import { initNav, navigate, replaceScreen } from './nav.js';
+import { lineChart, pairBars } from './charts.js';
+import { mountRedeem } from './redeem-ui.js';
 
 const root = document.getElementById('app');
 const S = { token: tget(), me: null, tab: 'overview', health: { addressCheck: false }, analytics: null, partners: [], authMode: 'signup' };
@@ -32,8 +35,10 @@ async function reload() {
 
 function bar(right = '') {
   return `${MODE === 'demo' ? '<div class="banner">Demo mode: data stays in this browser. Demo logins are listed on the sign-in tab.</div>' : ''}
-    <header class="topbar"><div class="topbar-in"><a class="brand" href="index.html"><img src="icon.svg" alt="">LocalHints <span class="badge b-brand">Business</span></a><span class="grow"></span>${right}</div></header>`;
+    <header class="topbar"><div class="topbar-in"><a class="brand" href="index.html"><img src="icon.svg" alt="">LocalHints <span class="badge b-brand">Business</span></a><span class="grow"></span>${installButtonHtml()}${settingsButtonHtml()}${right}</div></header>`;
 }
+const chrome = () => bindChrome(root, 'LocalHints Business');
+const goTab = (tab) => navigate({ tab });
 
 // ---------------------------------------------------------------- address checker (shared by sign-up and profile)
 
@@ -103,11 +108,15 @@ function authScreen() {
         <p class="small muted">You start on <b>Free Starter</b> (${LIMITS.free.dealsPerMonth} deals and ${LIMITS.free.savesPerMonth} wallet saves a month). We draft your first deal for you to edit, and an admin reviews new businesses before deals go live.</p>` : ''}
       <div id="authErr"></div>
       <button class="btn btn-primary btn-block" id="authGo">${signup ? 'Create account' : 'Sign in'}</button>
+      ${signup ? '' : '<p class="center"><button type="button" class="link" id="forgot">Forgot your password?</button></p>'}
     </form>
     ${!signup && MODE === 'demo' ? `<div class="card flat stack"><h3>Demo accounts</h3><p class="small muted">Password for all: <b>${esc(DEMO_PASSWORD)}</b></p>
       ${DEMO_LOGINS.map((d) => `<button type="button" class="btn btn-sm" data-demo="${esc(d.email)}" style="justify-content:flex-start;text-align:left"><span><b>${esc(d.email)}</b><br><span class="small muted">${esc(d.note)}</span></span></button>`).join('')}</div>` : ''}
   </div></main>`;
-  root.querySelectorAll('[data-mode]').forEach((b) => (b.onclick = () => { S.authMode = b.dataset.mode; authScreen(); }));
+  chrome();
+  root.querySelectorAll('[data-mode]').forEach((b) => (b.onclick = () => navigate({ auth: b.dataset.mode })));
+  const fg = root.querySelector('#forgot');
+  if (fg) fg.onclick = () => forgotSheet(root.querySelector('#authForm').email.value);
   if (signup) bindAddress(root.querySelector('#addrBox'), a);
   root.querySelectorAll('[data-demo]').forEach((b) => (b.onclick = () => { const f = root.querySelector('#authForm'); f.email.value = b.dataset.demo; f.password.value = DEMO_PASSWORD; }));
   root.querySelector('#authForm').onsubmit = (e) => {
@@ -125,6 +134,7 @@ function authScreen() {
         tset(r.token);
         S.tab = 'overview';
         await reload();
+        replaceScreen({ tab: 'overview' });
         dashboard();
         toast(signup ? 'Welcome! Your account is ready.' : 'Signed in.');
       } catch (ex) {
@@ -134,9 +144,48 @@ function authScreen() {
   };
 }
 
+// ---------------------------------------------------------------- forgot / reset password
+
+function forgotSheet(email) {
+  const el = openSheet(`<h2>Reset your password</h2><p class="muted mt">Enter your account email. We will send a link to choose a new password.</p>
+    <form id="ff" class="stack mt-lg" novalidate><label class="field"><span class="lbl">Email</span><input class="input" name="email" type="email" autocomplete="email" value="${esc(email || '')}" required></label>
+      <div id="fo"></div><button class="btn btn-primary btn-block">Email me a link</button></form>`);
+  el.querySelector('#ff').onsubmit = (e) => {
+    e.preventDefault();
+    guard(e.submitter, async () => {
+      try {
+        const r = await api.post('/api/business/forgot', { email: e.target.email.value });
+        el.querySelector('#fo').innerHTML = `<div class="okmsg" role="status">${esc(r.message)}</div>${r.demoLink ? `<a class="btn btn-block mt" href="${esc(r.demoLink)}">Open the reset link</a>` : ''}`;
+      } catch (ex) { el.querySelector('#fo').innerHTML = `<div class="err" role="alert">${esc(ex.message)}</div>`; }
+    });
+  };
+}
+function resetScreen(tok) {
+  root.innerHTML = `${bar()}<main class="page"><div class="narrow stack-lg"><div class="hero"><h1>Choose a new password</h1><p class="muted">At least 8 characters, with a letter and a number.</p></div>
+    <form id="rf" class="card stack" novalidate>
+      <label class="field"><span class="lbl">New password</span><input class="input" name="password" type="password" autocomplete="new-password" required></label>
+      <label class="field"><span class="lbl">Type it again</span><input class="input" name="again" type="password" autocomplete="new-password" required></label>
+      <div id="re"></div><button class="btn btn-primary btn-block">Save new password</button></form></div></main>`;
+  chrome();
+  root.querySelector('#rf').onsubmit = (e) => {
+    e.preventDefault();
+    const f = e.target;
+    if (f.password.value !== f.again.value) return (root.querySelector('#re').innerHTML = '<div class="err" role="alert">The two passwords are different.</div>');
+    guard(e.submitter, async () => {
+      try {
+        await api.post('/api/business/reset', { token: tok, password: f.password.value });
+        history.replaceState({ lh: 1, auth: 'signin' }, '', 'business.html');
+        S.authMode = 'signin';
+        authScreen();
+        toast('Password changed. Sign in with your new password.');
+      } catch (ex) { root.querySelector('#re').innerHTML = `<div class="err" role="alert">${esc(ex.message)}</div>`; }
+    });
+  };
+}
+
 // ---------------------------------------------------------------- dashboard shell
 
-const TABS = [['overview', 'Overview'], ['deals', 'Deals'], ['reach', 'Reach'], ['loop', 'Loop-In'], ['insights', 'Insights'], ['account', 'Account']];
+const TABS = [['overview', 'Overview'], ['deals', 'Deals'], ['team', 'Team'], ['reach', 'Reach'], ['loop', 'Loop-In'], ['insights', 'Insights'], ['account', 'Account']];
 function dashboard() {
   const b = biz();
   root.innerHTML = `${bar(`<span class="small muted only-desktop">${esc(b.name)}</span><button class="btn btn-sm" id="out">Sign out</button>`)}
@@ -145,9 +194,10 @@ function dashboard() {
         <div class="row wrap" style="gap:6px;margin-top:4px">${statusBadge(b.status)}${planBadge(b)}</div></div></div></div>
       <div class="tabs" role="tablist">${TABS.map(([id, l]) => `<button role="tab" aria-selected="${S.tab === id}" data-tab="${id}">${l}${id === 'loop' && pendingIncoming().length ? ' •' : ''}</button>`).join('')}</div>
       <div id="view"></div></main>`;
-  root.querySelector('#out').onclick = () => { tset(''); S.me = null; authScreen(); };
-  root.querySelectorAll('[data-tab]').forEach((t) => (t.onclick = () => { S.tab = t.dataset.tab; dashboard(); }));
-  ({ overview: vOverview, deals: vDeals, reach: vReach, loop: vLoop, insights: vInsights, account: vAccount })[S.tab](root.querySelector('#view'));
+  chrome();
+  root.querySelector('#out').onclick = () => { tset(''); S.me = null; S.authMode = 'signin'; replaceScreen({ auth: 'signin' }); authScreen(); };
+  root.querySelectorAll('[data-tab]').forEach((t) => (t.onclick = () => { if (S.tab === t.dataset.tab) return; goTab(t.dataset.tab); }));
+  ({ overview: vOverview, deals: vDeals, team: vTeam, reach: vReach, loop: vLoop, insights: vInsights, account: vAccount })[S.tab](root.querySelector('#view'));
 }
 const statusBadge = (s) => `<span class="badge ${{ approved: 'b-good', pending: 'b-warn', suspended: 'b-bad', closed: 'b-bad' }[s]}">${{ approved: 'Approved', pending: 'Waiting for approval', suspended: 'Suspended', closed: 'Closed' }[s]}</span>`;
 const planBadge = (b) => b.effectiveTier === 'pro' ? `<span class="badge b-pro">${b.pilotEndsAt > Date.now() ? 'Pro (pilot)' : 'Pro'}</span>` : '<span class="badge">Free Starter</span>';
@@ -162,7 +212,7 @@ function upsell(text) {
   return `<div class="note stack"><span>${esc(text)}</span><button class="btn btn-sm btn-primary" data-upgrade>See Pro</button></div>`;
 }
 function bindUpgrade(scope) {
-  scope.querySelectorAll('[data-upgrade]').forEach((b) => (b.onclick = () => { closeSheet(true); S.tab = 'account'; dashboard(); }));
+  scope.querySelectorAll('[data-upgrade]').forEach((b) => (b.onclick = () => goTab('account')));
 }
 
 // ---------------------------------------------------------------- overview
@@ -190,25 +240,13 @@ function vOverview(v) {
       <div class="stat"><b>${u.saves}</b><span>Wallet saves this month${l.savesPerMonth < UNLIMITED ? ` (limit ${l.savesPerMonth})` : ''}${meter(u.saves, l.savesPerMonth)}</span></div>
       <div class="stat"><b>${u.dealsPublished}</b><span>Deals published this month (${lim(l.dealsPerMonth)})${meter(u.dealsPublished, l.dealsPerMonth)}</span></div>
       <div class="stat"><b>${S.me.deals.reduce((n, d) => n + d.metrics.redemptions, 0)}</b><span>Total redemptions</span></div></div>
-    <div class="card stack"><h2>Redeem a pass</h2><p class="muted small">Type the code from the customer’s pass (or what their QR code shows).</p>
-      <form id="redeemForm" class="row"><input class="input grow" name="code" placeholder="Pass code" autocapitalize="characters" autocomplete="off" maxlength="14" required><button class="btn btn-primary">Redeem</button></form><div id="redeemOut"></div></div>
+    <div class="card stack"><h2>Redeem a pass</h2><p class="muted small">Enter the customer’s pass code and what they are buying. We work out the price after the deal and record both, so your results are real. Your team can do this too: see the <b>Team</b> tab.</p>
+      <div id="redeemBox"></div></div>
   </div>`;
   v.querySelectorAll('[data-edit]').forEach((x) => (x.onclick = () => dealForm(S.me.deals.find((d) => d.id === x.dataset.edit))));
   v.querySelectorAll('[data-pub]').forEach((x) => (x.onclick = () => guard(x, () => publishNow(x.dataset.pub))));
   v.querySelectorAll('[data-loop]').forEach((x) => (x.onclick = () => guard(x, () => loopAction(x.dataset.loop, x.dataset.act))));
-  v.querySelector('#redeemForm').onsubmit = (e) => { e.preventDefault(); redeem(e.target.code.value, v.querySelector('#redeemOut'), e.target); };
-}
-async function redeem(code, out, form, confirmMinSpend) {
-  try {
-    const r = await call('POST', '/api/business/redeem', { code, confirmMinSpend });
-    out.innerHTML = `<div class="okmsg mt">✅ ${esc(r.message)}</div>`;
-    form.reset();
-    await reload();
-    setTimeout(() => S.tab === 'overview' && dashboard(), 2500);
-  } catch (e) {
-    if (e.data && e.data.needsMinSpend && await confirmSheet('Minimum spend', e.message, 'Yes, redeem')) return redeem(code, out, form, true);
-    out.innerHTML = `<div class="err mt">${esc(e.message)}</div>`;
-  }
+  mountRedeem(v.querySelector('#redeemBox'), { locations: b.locations, send: (body) => call('POST', '/api/business/redeem', body), onDone: () => { reload(); } });
 }
 async function publishNow(id) {
   try {
@@ -435,7 +473,108 @@ async function loopForm() {
   };
 }
 
+// ---------------------------------------------------------------- team (staff / clerks) + how redemption works
+
+const METHOD = { qr: 'QR code', sms: 'Text message', email: 'Email' };
+const STAFF_BADGE = { invited: 'b-warn', accepted: 'b-good', suspended: 'b-bad' };
+const dollars = (n) => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const absUrl = (path) => new URL(path, location.href).href;
+
+async function vTeam(v) {
+  v.innerHTML = '<div class="spinner">Loading…</div>';
+  let t;
+  try { t = await call('GET', '/api/business/staff'); } catch (e) { return (v.innerHTML = `<div class="err">${esc(e.message)}</div>`); }
+  if (S.tab !== 'team') return;
+  const b = biz();
+  const rows = t.staff;
+  const sum = (k) => rows.reduce((n, r) => n + r[k], 0) + t.owner[k];
+  const multi = t.locations.length > 1;
+  v.innerHTML = `<div class="stack-lg">
+    <div class="card stack"><h2>How passes get redeemed</h2>
+      <ul class="small" style="padding-left:18px;margin:0">
+        <li><b>You (the owner):</b> enter the pass code and the purchase total on the Overview tab. It is logged under “Owner”.</li>
+        <li><b>Your team:</b> invite each person below. They get their own page (no password) with just the redeem form, and every redemption is logged under their name, so you can see who rang up what.</li>
+        <li><b>Nobody redeems, nothing counts.</b> Customers cannot mark their own pass used, so the numbers in Insights stay honest. Every redemption needs the code <i>and</i> the purchase total, so we can show the price before and after the deal.</li>
+      </ul>
+      <p class="small muted">Tip: invite in person with the QR code (the person scans it with their phone camera). It is the safest, because the link never travels through a text or email that someone else could open first. Text and email invites work too, and each link works once and expires in 7 days.</p></div>
+    <div class="card stack"><div class="row between wrap"><h2>Your team</h2><span class="small muted">${t.used} of ${t.limit} team members${effectiveTierFree() ? ' on Free' : ''}</span></div>
+      <button class="btn btn-primary" id="inv" ${b.status === 'approved' ? '' : 'disabled'}>+ Invite a team member</button>
+      ${b.status === 'approved' ? '' : '<p class="hint">You can invite people once your account is approved.</p>'}
+      <div class="tablewrap"><table class="t cards"><thead><tr><th>Team member</th><th>Invited by</th><th>Status</th><th>Redeemed</th><th>Purchases before deals</th><th>After deals (calculated)</th><th></th></tr></thead><tbody>
+      <tr><td class="first"><b>You (owner)</b></td><td data-label="Invited by">—</td><td data-label="Status"><span class="badge b-good">Owner</span></td><td data-label="Redeemed">${t.owner.redemptions}</td><td data-label="Before">${dollars(t.owner.before)}</td><td data-label="After">${dollars(t.owner.after)}</td><td></td></tr>
+      ${rows.map((r) => `<tr><td class="first"><b>${esc(r.name)}</b>${multi ? `<div class="small muted">${esc(r.locationName)}</div>` : ''}</td>
+        <td data-label="Invited by"><b>${esc(METHOD[r.method])}</b>${r.contact ? `<div class="small muted">${esc(r.contact)}</div>` : ''}</td>
+        <td data-label="Status"><span class="badge ${STAFF_BADGE[r.status]}">${r.status[0].toUpperCase() + r.status.slice(1)}</span>${r.status === 'invited' && !r.inviteOpen ? '<div class="tiny muted">link expired</div>' : ''}</td>
+        <td data-label="Redeemed">${r.redemptions}</td><td data-label="Before">${dollars(r.before)}</td><td data-label="After">${dollars(r.after)}</td>
+        <td><div class="row wrap" style="justify-content:flex-end">${r.status === 'invited' ? `<button class="btn btn-sm" data-sa="reinvite" data-sid="${esc(r.id)}">Show link / QR</button>` : ''}${r.status === 'accepted' ? `<button class="btn btn-sm" data-sa="suspend" data-sid="${esc(r.id)}">Suspend</button>` : ''}${r.status === 'suspended' ? `<button class="btn btn-sm btn-primary" data-sa="reinstate" data-sid="${esc(r.id)}">Reinstate</button>` : ''}<button class="btn btn-sm btn-danger" data-sa="remove" data-sid="${esc(r.id)}">Remove</button></div></td></tr>`).join('')}
+      <tr><td class="first"><b>Everyone</b></td><td></td><td></td><td data-label="Redeemed"><b>${sum('redemptions')}</b></td><td data-label="Before"><b>${dollars(sum('before'))}</b></td><td data-label="After"><b>${dollars(sum('after'))}</b></td><td></td></tr>
+      </tbody></table></div>
+      <p class="hint">“After deals” is the price the customer paid once the deal was applied. For % off, $ off and bundle deals it is calculated exactly; for buy-one-get-one and free-item deals it is an estimate unless the amount charged was entered.</p></div></div>`;
+  v.querySelector('#inv').onclick = () => inviteForm(t);
+  v.querySelectorAll('[data-sa]').forEach((x) => (x.onclick = () => guard(x, async () => {
+    const a = x.dataset.sa;
+    if (a === 'remove' && !(await confirmSheet('Remove this team member?', 'They will not be able to redeem passes any more. Their past redemptions stay in your numbers.', 'Remove', true))) return;
+    const r = await call('POST', `/api/business/staff/${x.dataset.sid}`, { action: a });
+    if (a === 'reinvite') return showInvite(r);
+    toast('Done.');
+    vTeam(v);
+  })));
+}
+const effectiveTierFree = () => !isPro();
+
+function inviteForm(t) {
+  const el = openSheet(`<h2>Invite a team member</h2><p class="muted mt">They get a link that opens the redeem page on their phone. No password needed.</p>
+    <form id="sf" class="stack-lg mt-lg" novalidate>
+      <label class="field"><span class="lbl">Name</span><input class="input" name="name" maxlength="60" required></label>
+      <label class="field"><span class="lbl">How do you want to invite them?</span><select class="input" name="method"><option value="qr">QR code (in person, recommended)</option><option value="sms">Text message</option><option value="email">Email</option></select></label>
+      <label class="field hide" id="cBox"><span class="lbl" id="cLbl">Mobile number</span><input class="input" name="contact" maxlength="120"></label>
+      ${t.locations.length > 1 ? `<label class="field"><span class="lbl">Works at</span><select class="input" name="locationId">${t.locations.map((l) => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join('')}</select></label>` : ''}
+      <div id="sfErr"></div>
+      <div class="row"><button type="button" class="btn grow" data-close>Cancel</button><button class="btn btn-primary grow">Create invite</button></div></form>`);
+  const f = el.querySelector('#sf');
+  const sync = () => {
+    const m = f.method.value;
+    el.querySelector('#cBox').classList.toggle('hide', m === 'qr');
+    el.querySelector('#cLbl').textContent = m === 'sms' ? 'Mobile number' : 'Email address';
+    f.contact.type = m === 'email' ? 'email' : 'tel';
+  };
+  f.method.onchange = sync;
+  sync();
+  f.onsubmit = (e) => {
+    e.preventDefault();
+    guard(e.submitter, async () => {
+      try {
+        const r = await call('POST', '/api/business/staff', Object.fromEntries(new FormData(f)));
+        await showInvite(r);
+      } catch (ex) { el.querySelector('#sfErr').innerHTML = `<div class="err" role="alert">${esc(ex.message)}</div>`; }
+    });
+  };
+}
+
+async function showInvite(r) {
+  const st = r.staff;
+  const url = r.inviteUrl || absUrl(r.invitePath);
+  const text = `Hi ${st.name}, ${r.businessName} invited you to redeem LocalHints deals. Open this link on your phone (works once, valid 7 days): ${url}`;
+  const el = openSheet(`<h2>Invite for ${esc(st.name)}</h2>
+    ${r.emailed ? `<div class="okmsg mt">We emailed the link to ${esc(st.contact)}.</div>` : ''}
+    <p class="muted mt">${st.method === 'qr' ? 'Have them scan this with their phone camera.' : 'You can still use the QR code if they are standing next to you.'}</p>
+    <div class="qrbox mt" id="iq"></div>
+    <div class="row mt-lg"><input class="input grow" readonly value="${esc(url)}" id="iu" aria-label="Invite link"><button class="btn btn-sm" id="ic">Copy</button></div>
+    <div class="row wrap mt">
+      ${st.method === 'sms' ? `<a class="btn btn-primary grow" href="sms:${esc(st.contact)}?&body=${encodeURIComponent(text)}">Send text message</a>` : ''}
+      ${st.method === 'email' && !r.emailed ? `<a class="btn btn-primary grow" href="mailto:${esc(st.contact)}?subject=${encodeURIComponent(r.businessName + ' invited you to LocalHints')}&body=${encodeURIComponent(text)}">Open email</a>` : ''}
+      <button class="btn grow" data-close>Done</button></div>
+    <p class="hint">The link works one time. When ${esc(st.name)} accepts, the status changes to Accepted.</p>`);
+  qrSvg(url).then((svg) => { const q = el.querySelector('#iq'); if (q) q.innerHTML = svg; });
+  el.querySelector('#ic').onclick = async () => { try { await navigator.clipboard.writeText(url); toast('Link copied.'); } catch { el.querySelector('#iu').select(); } };
+  if (S.tab === 'team') { try { vTeam(root.querySelector('#view')); } catch { /* ignore */ } }
+}
+
 // ---------------------------------------------------------------- insights
+
+const fmtMoney0 = (n) => '$' + Math.round(n).toLocaleString('en-US');
+const METRICS = { saves: ['Wallet saves', (n) => String(Math.round(n))], redemptions: ['Redeemed', (n) => String(Math.round(n))], sales: ['Sales after the deal ($)', fmtMoney0] };
+const view = { mode: 'deals', metric: 'redemptions', picked: null };
 
 async function vInsights(v) {
   v.innerHTML = '<div class="spinner">Loading…</div>';
@@ -443,35 +582,105 @@ async function vInsights(v) {
   try { a = await call('GET', '/api/business/analytics'); } catch (e) { return (v.innerHTML = `<div class="err">${esc(e.message)}</div>`); }
   if (S.tab !== 'insights') return;
   const t = a.totals;
-  const totals = `<div class="stats"><div class="stat"><b>${t.views}</b><span>Views</span></div><div class="stat"><b>${t.saves}</b><span>Wallet saves</span></div><div class="stat"><b>${t.redemptions}</b><span>Redemptions</span></div><div class="stat"><b>${a.locked ? '—' : money(t.revenue)}</b><span>Est. sales from deals</span></div></div>`;
+  const basic = `<div class="stat"><b>${t.views}</b><span>Views</span></div><div class="stat"><b>${t.saves}</b><span>Wallet saves</span></div><div class="stat"><b>${t.redemptions}</b><span>Redemptions</span></div>`;
   if (a.locked) {
-    v.innerHTML = `<div class="stack-lg">${totals}
-      <div class="locked card"><div class="blur stack"><h2>Full funnel</h2><div class="funnel">${['Views', 'Saves', 'Friend shares', 'Redeemed'].map((l, i) => `<div class="step"><div class="small">${l}</div><div class="bar" style="width:${100 - i * 24}%">${400 - i * 90}</div></div>`).join('')}</div>
-        <h2>Neighborhood benchmarks</h2><p>You vs. similar shops nearby…</p><h2>Compare past deals</h2><p>See which deal worked best…</p></div>
-        <div class="cta"><span class="badge b-pro">Pro</span><h2>See what works</h2><p class="muted">The full funnel, Neighborhood Benchmarks, and Compare Metrics for your past deals.</p><button class="btn btn-primary" data-upgrade>See Pro</button></div></div></div>`;
+    v.innerHTML = `<div class="stack-lg"><div class="stats">${basic}<div class="stat"><b>—</b><span>Sales from deals</span></div></div>
+      <div class="locked card"><div class="blur stack"><h2>Results over time</h2><div class="funnel">${['Views', 'Saves', 'Friend shares', 'Redeemed'].map((l, i) => `<div class="step"><div class="small">${l}</div><div class="bar" style="width:${100 - i * 24}%">${400 - i * 90}</div></div>`).join('')}</div>
+        <h2>Charts for each deal and location</h2><p>See which deal worked best…</p><h2>Neighborhood benchmarks</h2><p>You vs. similar shops nearby…</p></div>
+        <div class="cta"><span class="badge b-pro">Pro</span><h2>See what works</h2><p class="muted">Graphs for every deal and location, the full funnel, Neighborhood Benchmarks, and Compare Metrics.</p><button class="btn btn-primary" data-upgrade>See Pro</button></div></div></div>`;
     return bindUpgrade(v);
   }
   const max = Math.max(1, t.views);
   const step = (l, n) => `<div class="step"><div class="row between small"><span>${l}</span><span class="muted">${n}</span></div><div class="bar" style="width:${Math.max(6, (n / max) * 100)}%">${n}</div></div>`;
   const bm = a.benchmark;
   const cmp = (mine, theirs, label) => `<div class="stat"><span>${label}</span><b>${pct(mine)}</b><span style="color:${mine >= theirs ? 'var(--good-ink)' : 'var(--bad-ink)'}">${mine >= theirs ? '▲' : '▼'} Neighborhood: ${pct(theirs)}</span></div>`;
+  const hasLocs = a.locations.length > 1;
+  if (!hasLocs && view.mode === 'locations') view.mode = 'deals';
   let sortKey = 'startsAt';
   const table = () => {
     const rows = a.deals.slice().sort((x, y) => (sortKey === 'title' ? x.title.localeCompare(y.title) : y[sortKey] - x[sortKey]));
     const maxRate = Math.max(0.01, ...rows.map((r) => r.redeemRate));
-    return `<div class="tablewrap"><table class="t cards"><thead><tr><th>Deal</th><th>Ran</th><th>Views</th><th>Saves</th><th>Redeemed</th><th>Redeem rate</th><th>Est. sales</th></tr></thead><tbody>
-      ${rows.map((r) => `<tr class="${r.best ? 'best' : ''}"><td class="first"><b>${esc(r.title)}</b> ${r.best ? '<span class="badge b-good">⭐ Best</span>' : ''}<div class="small muted">${esc(r.label)} · ${r.past ? 'Past' : 'Running'}</div></td>
+    return `<div class="tablewrap"><table class="t cards"><thead><tr><th>Deal</th><th>Ran</th><th>Views</th><th>Saves</th><th>Redeemed</th><th>Redeem rate</th><th>Sales after deal</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr class="clickable ${r.best ? 'best' : ''}" data-deal="${esc(r.id)}"><td class="first"><b>${esc(r.title)}</b> ${r.best ? '<span class="badge b-good">⭐ Best</span>' : ''}<div class="small muted">${esc(r.label)} · ${r.past ? 'Past' : 'Running'} · tap for graph</div></td>
         <td data-label="Ran">${esc(fmtDate(r.startsAt))}</td><td data-label="Views">${r.views}</td><td data-label="Saves"><span>${r.saves} <span class="muted small">(${pct(r.saveRate)})</span></span></td>
-        <td data-label="Redeemed">${r.redemptions}</td><td data-label="Redeem rate"><div style="min-width:90px"><b>${pct(r.redeemRate)}</b><div class="meter" style="margin-top:4px"><i style="width:${(r.redeemRate / maxRate) * 100}%"></i></div></div></td><td data-label="Est. sales">${money(r.revenue)}</td></tr>`).join('')}</tbody></table></div>`;
+        <td data-label="Redeemed">${r.redemptions}</td><td data-label="Redeem rate"><div style="min-width:90px"><b>${pct(r.redeemRate)}</b><div class="meter" style="margin-top:4px"><i style="width:${(r.redeemRate / maxRate) * 100}%"></i></div></div></td><td data-label="Sales after deal">${money(r.revenue)}${r.revenueEstimated ? ' <span class="muted small">(est.)</span>' : ''}</td></tr>`).join('')}</tbody></table></div>`;
   };
-  v.innerHTML = `<div class="stack-lg">${totals}
+  v.innerHTML = `<div class="stack-lg">
+    <div class="stats six">${basic}<div class="stat"><b>${money(t.before)}</b><span>Purchases before deals</span></div><div class="stat"><b>${money(t.after)}</b><span>After deals (calculated)</span></div><div class="stat"><b>${money(Math.max(0, t.before - t.after))}</b><span>Discounts given</span></div></div>
+    <div class="card stack"><div class="row between wrap"><h2>Results over time</h2>
+        <div class="seg" role="tablist" style="min-width:240px"><button role="tab" data-mode="deals" aria-selected="${view.mode === 'deals'}">Deals</button><button role="tab" data-mode="locations" aria-selected="${view.mode === 'locations'}" ${hasLocs ? '' : 'title="Add a second location in Account"'}>Locations</button></div></div>
+      <label class="row small muted">Measure <select class="input" id="metric" style="width:auto;min-height:34px;padding:2px 10px">${Object.entries(METRICS).filter(([k]) => view.mode === 'deals' || k !== 'saves').map(([k, [l]]) => `<option value="${k}" ${view.metric === k ? 'selected' : ''}>${l}</option>`).join('')}</select><span>· last 30 days</span></label>
+      <div id="chips" class="chips" aria-label="Choose what to compare"></div><div id="plot"></div><div id="extra"></div>
+      ${!hasLocs ? '<p class="hint">Run more than one shop? Pro lets you add locations in the Account tab, then compare them here.</p>' : ''}</div>
     <div class="card"><h2>Your funnel</h2><div class="funnel mt">${step('Saw your deal', t.views)}${step('Saved to wallet', t.saves)}${step('Friends who saved from a share', t.shares)}${step('Came in and redeemed', t.redemptions)}</div></div>
     <div class="card stack"><h2>Neighborhood benchmarks</h2>
       <p class="small muted">${bm.source === 'platform' ? `Compared with ${bm.sample} similar ${esc(catLabel(biz().category))} shops on LocalHints.` : 'Not enough nearby shops yet, so this uses typical numbers for your category.'}</p>
       <div class="stats">${cmp(a.rates.saveRate, bm.saveRate, 'Save rate')}${cmp(a.rates.redeemRate, bm.redeemRate, 'Redeem rate')}</div></div>
-    <div class="card stack"><h2>What to try next</h2><ul style="padding-left:18px;margin:0">${a.insights.map((i) => `<li style="margin:6px 0">${esc(i)}</li>`).join('')}</ul></div>
-    <div class="card stack"><div class="row between wrap"><h2>Compare past deals</h2><label class="row small muted">Sort by <select class="input" id="sortBy" style="width:auto;min-height:34px;padding:2px 10px"><option value="startsAt">Newest</option><option value="redeemRate">Redeem rate</option><option value="redemptions">Redeemed</option><option value="revenue">Est. sales</option><option value="saves">Saves</option></select></label></div><div id="cmp">${table()}</div></div></div>`;
-  v.querySelector('#sortBy').onchange = (e) => { sortKey = e.target.value; v.querySelector('#cmp').innerHTML = table(); };
+    <div class="card stack"><h2>What to try next</h2><ul style="padding-left:18px;margin:0" id="tips">${a.insights.map((i) => `<li style="margin:6px 0">${esc(i)}</li>`).join('')}</ul>
+      <div id="aiOut"></div>
+      <button class="btn btn-sm" id="ai">✨ Get fresh ideas</button>
+      <p class="hint" id="aiNote">${a.aiAvailable ? 'Ideas are written by Claude from your totals only (no customer details leave LocalHints).' : 'These tips come from simple rules. When the server has an Anthropic key, this button asks Claude for fresh ideas.'}</p></div>
+    <div class="card stack"><div class="row between wrap"><h2>Compare past deals</h2><label class="row small muted">Sort by <select class="input" id="sortBy" style="width:auto;min-height:34px;padding:2px 10px"><option value="startsAt">Newest</option><option value="redeemRate">Redeem rate</option><option value="redemptions">Redeemed</option><option value="revenue">Sales after deal</option><option value="saves">Saves</option></select></label></div><div id="cmp">${table()}</div></div></div>`;
+
+  const bindTable = () => v.querySelectorAll('[data-deal]').forEach((tr) => (tr.onclick = () => dealSheet(a, a.deals.find((d) => d.id === tr.dataset.deal))));
+  bindTable();
+  v.querySelector('#sortBy').onchange = (e) => { sortKey = e.target.value; v.querySelector('#cmp').innerHTML = table(); bindTable(); };
+  v.querySelectorAll('[data-mode]').forEach((b) => (b.onclick = () => { if (b.dataset.mode === 'locations' && !hasLocs) return toast('Add a second location in the Account tab first.', 'bad'); view.mode = b.dataset.mode; if (view.mode === 'locations' && view.metric === 'saves') view.metric = 'redemptions'; vInsights(v); }));
+  v.querySelector('#metric').onchange = (e) => { view.metric = e.target.value; drawMain(); };
+
+  // items to compare: deals or locations; each keeps its own color slot so colors never change when you toggle others
+  const items = () => (view.mode === 'deals'
+    ? a.deals.map((d, i) => ({ id: d.id, name: d.title, slot: (i % 5) + 1, values: (k) => a.series.perDeal[d.id][k] }))
+    : a.locations.map((l, i) => ({ id: l.id, name: l.name, slot: (i % 5) + 1, values: (k) => a.series.perLocation[l.id][k === 'saves' ? 'redemptions' : k] })));
+  const activity = (it, k) => it.values(k).reduce((x, y) => x + y, 0);
+  function drawMain() {
+    const all = items();
+    const key = `${view.mode}`;
+    if (!view.picked || view.picked.key !== key || !view.picked.ids.every((id) => all.some((x) => x.id === id))) {
+      view.picked = { key, ids: all.slice().sort((x, y) => activity(y, view.metric) - activity(x, view.metric)).filter((x) => activity(x, view.metric) > 0).slice(0, 4).map((x) => x.id) };
+      if (!view.picked.ids.length) view.picked.ids = all.slice(0, 2).map((x) => x.id);
+    }
+    const chosen = all.filter((x) => view.picked.ids.includes(x.id));
+    const usedSlots = new Set(chosen.map((x) => x.slot));
+    v.querySelector('#chips').innerHTML = all.map((x) => {
+      const on = view.picked.ids.includes(x.id);
+      const blocked = !on && (usedSlots.has(x.slot) || chosen.length >= 5);
+      return `<button class="chip" aria-pressed="${on}" data-pick="${esc(x.id)}" ${blocked ? 'disabled title="Up to 5 at a time, each in its own color"' : ''}>${esc(x.name)}</button>`;
+    }).join('');
+    v.querySelectorAll('[data-pick]').forEach((b) => (b.onclick = () => { const id = b.dataset.pick; const ids = view.picked.ids; view.picked.ids = ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]; drawMain(); }));
+    const [label, fmt] = METRICS[view.metric];
+    const host = v.querySelector('#plot');
+    host.innerHTML = '';
+    if (!chosen.length) host.innerHTML = '<p class="hint">Pick at least one above.</p>';
+    else lineChart(host, { days: a.series.days, label: `${label} per day`, fmt, series: chosen.map((x) => ({ id: x.id, name: x.name, color: x.slot, values: x.values(view.metric) })) });
+    const extra = v.querySelector('#extra');
+    if (view.mode === 'locations') {
+      const L = a.locations.map((l) => a.series.perLocation[l.id]);
+      extra.innerHTML = '<h3 class="mt-lg">Purchases before and after deals, by location (all time)</h3><div id="pb" class="mt"></div>';
+      pairBars(extra.querySelector('#pb'), { rows: L.map((l) => ({ label: l.name, a: l.before, b: l.after })), aName: 'Before the deal', bName: 'After the deal', fmt: (n) => dollars(n) });
+    } else extra.innerHTML = '';
+  }
+  drawMain();
+
+  const ai = v.querySelector('#ai');
+  ai.onclick = () => guard(ai, async () => {
+    const r = await call('POST', '/api/business/advice', { refresh: true });
+    v.querySelector('#aiOut').innerHTML = `<div class="card flat stack"><b>${r.source === 'ai' ? '✨ Ideas from Claude' : 'Ideas from your numbers'}</b><ul style="padding-left:18px;margin:0">${r.tips.map((x) => `<li style="margin:6px 0">${esc(x)}</li>`).join('')}</ul></div>`;
+    if (r.source !== 'ai') v.querySelector('#aiNote').textContent = 'AI ideas are not turned on for this server yet, so these come from simple rules.';
+  });
+}
+
+function dealSheet(a, r) {
+  if (!r) return;
+  const sr = a.series.perDeal[r.id];
+  const el = openSheet(`<h2>${esc(r.title)}</h2><div class="small muted">${esc(r.label)} · ${esc(fmtDate(r.startsAt))} to ${esc(fmtDate(r.endsAt))} · ${r.past ? 'Past' : 'Running'}</div>
+    <div class="stats mt-lg"><div class="stat"><b>${r.views}</b><span>Views</span></div><div class="stat"><b>${r.saves}</b><span>Saves</span></div><div class="stat"><b>${r.redemptions}</b><span>Redeemed (${pct(r.redeemRate)})</span></div><div class="stat"><b>${money(r.after)}</b><span>Sales after deal${r.revenueEstimated ? ' (est.)' : ''}</span></div></div>
+    <p class="small muted mt">Purchases before the deal: <b>${dollars(r.before)}</b> · after the deal: <b>${dollars(r.after)}</b></p>
+    <h3 class="section-title">Saves and redemptions per day (last 30 days)</h3><div id="c1"></div>
+    <h3 class="section-title">Sales after the deal ($ per day)</h3><div id="c2"></div>
+    <button class="btn btn-block mt-lg" data-close>Close</button>`, { wide: true });
+  lineChart(el.querySelector('#c1'), { days: a.series.days, label: 'Saves and redemptions per day', fmt: (n) => String(Math.round(n)), series: [{ id: 's', name: 'Saved', color: 1, values: sr.saves }, { id: 'r', name: 'Redeemed', color: 2, values: sr.redemptions }] });
+  lineChart(el.querySelector('#c2'), { days: a.series.days, label: 'Sales after the deal per day', fmt: fmtMoney0, series: [{ id: 'd', name: 'Sales after deal', color: 3, values: sr.sales }] });
 }
 
 // ---------------------------------------------------------------- account
@@ -492,6 +701,10 @@ function vAccount(v) {
     <div class="card stack"><h2>Your logo</h2>
       ${src ? `<div class="row"><div class="avatar" style="width:72px;height:72px"><img src="${esc(src)}" alt="Your logo"></div><div class="small muted">${b.logoShown ? 'Shown on your deals.' : 'Saved, but only shown while you are on Pro.'}</div></div>` : '<p class="muted">Free deals show the LocalHints logo. On Pro, your own logo appears on every deal and pass.</p>'}
       ${pro ? `<div class="row wrap"><label class="btn btn-sm">Upload logo<input type="file" id="logoFile" accept="image/png,image/jpeg,image/webp" class="hide"></label>${b.hasLogo ? '<button class="btn btn-sm btn-danger" id="logoDel">Remove</button>' : ''}</div><div class="hint">Square images look best. We shrink it to 256 pixels.</div>` : upsell('Uploading your own logo is a Pro feature.')}</div>
+    <div class="card stack"><div class="row between"><h2>Locations</h2><span class="badge b-pro">Pro</span></div>
+      <p class="muted small">Have more than one shop? Add each location so shoppers see every pin, and compare locations in Insights.</p>
+      <ul class="timeline">${b.locations.map((l) => `<li><span class="grow"><b>${esc(l.name)}</b><br><span class="muted small">${esc(l.address)}</span></span>${l.id === 'main' ? '<span class="badge">Main</span>' : `<button class="btn btn-sm btn-danger" data-locdel="${esc(l.id)}">Remove</button>`}</li>`).join('')}</ul>
+      ${b.effectiveTier === 'pro' ? '<button class="btn btn-sm" id="locAdd">+ Add a location</button>' : upsell('Multiple locations are a Pro feature (up to ' + LIMITS.pro.locations + ').')}</div>
     <div class="card stack"><h2>Business profile</h2><form id="pf" class="stack" novalidate>
       <label class="field"><span class="lbl">Business name</span><input class="input" name="name" value="${esc(b.name)}" maxlength="60"></label>
       <label class="field"><span class="lbl">Description</span><input class="input" name="blurb" value="${esc(b.blurb || '')}" maxlength="120"></label>
@@ -523,6 +736,13 @@ function vAccount(v) {
   });
   const ld = v.querySelector('#logoDel');
   if (ld) ld.onclick = () => guard(ld, async () => { await call('POST', '/api/business/logo/remove'); await reload(); dashboard(); });
+  v.querySelectorAll('[data-locdel]').forEach((x) => (x.onclick = () => guard(x, async () => {
+    if (!(await confirmSheet('Remove this location?', 'Its pin disappears from the map. Past results stay in your numbers.', 'Remove', true))) return;
+    await call('POST', `/api/business/locations/${x.dataset.locdel}/remove`);
+    await reload(); dashboard();
+  })));
+  const la = v.querySelector('#locAdd');
+  if (la) la.onclick = () => locationForm();
   v.querySelector('#pf').onsubmit = (e) => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.target));
@@ -538,7 +758,26 @@ function vAccount(v) {
   };
   v.querySelector('#close').onclick = async (e) => {
     if (!(await confirmSheet('Close your account?', 'All your deals will end and your shop will disappear from LocalHints.', 'Close account', true))) return;
-    guard(e.currentTarget, async () => { await call('POST', '/api/business/close'); tset(''); S.me = null; S.authMode = 'signin'; authScreen(); toast('Your account was closed.'); });
+    guard(e.currentTarget, async () => { await call('POST', '/api/business/close'); tset(''); S.me = null; S.authMode = 'signin'; replaceScreen({ auth: 'signin' }); authScreen(); toast('Your account was closed.'); });
+  };
+}
+
+function locationForm() {
+  const a = { address: '', verified: false, msg: '', placeId: '', ...jitterDemo() };
+  const el = openSheet(`<h2>Add a location</h2><form id="lf" class="stack-lg mt-lg" novalidate>
+    <label class="field"><span class="lbl">Name</span><input class="input" name="name" maxlength="60" placeholder="Downtown" required></label>
+    <div id="addrBox">${addressBlock(a)}</div><div id="lfErr"></div>
+    <div class="row"><button type="button" class="btn grow" data-close>Cancel</button><button class="btn btn-primary grow">Add location</button></div></form>`);
+  bindAddress(el.querySelector('#addrBox'), a);
+  el.querySelector('#lf').onsubmit = (e) => {
+    e.preventDefault();
+    guard(e.submitter, async () => {
+      try {
+        if (S.health.addressCheck && !a.verified) throw new Error('Please check the address and tap “Use this address”.');
+        await call('POST', '/api/business/locations', { name: e.target.name.value, address: a.address, lat: a.lat, lng: a.lng });
+        closeSheet(true); toast('Location added.'); await reload(); dashboard();
+      } catch (ex) { el.querySelector('#lfErr').innerHTML = `<div class="err" role="alert">${esc(ex.message)}</div>`; }
+    });
   };
 }
 
@@ -566,10 +805,16 @@ function shrinkImage(file) {
 
 async function boot() {
   registerServiceWorker();
+  const params = new URLSearchParams(location.search);
+  const resetTok = params.get('reset');
+  initNav(S.token ? { tab: 'overview' } : { auth: S.authMode }, (st) => {
+    if (S.me) { S.tab = st.tab || 'overview'; dashboard(); } else { S.authMode = st.auth || 'signin'; authScreen(); }
+  });
   try { S.health = await api.get('/api/health'); } catch (e) {
     root.innerHTML = `${bar()}<main class="page"><div class="empty"><div class="big">📡</div><p>${esc(e.message)}</p></div></main>`;
-    return;
+    return chrome();
   }
+  if (resetTok) return resetScreen(resetTok);
   if (S.token) {
     try { await reload(); return dashboard(); } catch { tset(''); }
   }
