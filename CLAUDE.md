@@ -104,6 +104,39 @@ Neighborhood Drop or Pass Push; read the funnel, benchmarks and past-deal compar
 see the pilot end date; update hours/address/logo; see why they were suspended or when they were approved;
 close the account.
 
+## V6 additions (shopper filters, heart, business reports, team cancel)
+
+- **Shopper list:** no search box or chips. Three custom popover menus (`.fbar/.fbtn/.fmenu` in consumer.js): **Deal Distance**
+  (0.5 to 50 miles, needs a location), **Deal Type** (All + 8 categories), **Sort Deals** (% off, $ off, ending; ▲ low to high,
+  ▼ high to low; deals that never end sort last on Ending ▲ and first on Ending ▼). State is `S.cat`, `S.sort`, `S.radius`.
+  The three buttons are equal width (CSS grid); the Map tab shows only distance + type.
+- **Heart:** bottom right of every deal card (`dealCard`). One tap calls the same claim route as "Save", so the pass lands in the
+  **LocalHints wallet** (the Wallet tab). It cannot add to Apple/Google Wallet silently (platforms require a user tap), so
+  that stays a button on the pass. Filled red = already saved; tapping a filled heart opens the pass. The card is a
+  `div[role=button]` because a button may not contain a button.
+- **Wallet tab = saved passes** (in LocalHints). Adding to the phone's wallet is a separate optional step.
+- **Reports (`GET /api/business/report?kind=live|published|saves|redemptions&from&to`):** live deals and published-this-month
+  sorted oldest first; saves this month with `savedAt`, `shared`, `sharedAt`, `friendSaves`, sorted oldest saved first;
+  redemptions per deal for [from,to) sorted most to least redeemed. Period keys used by the UI (`PERIODS` in business.js):
+  past week = last 7 days, previous week = the 7 days before, past month = last 30 days, previous month = the 30 before.
+  The Deals page period filter shows deals that were **running at any time** in the period (drafts only under All).
+  Overview tiles are buttons: `navigate({tab:'overview', list:kind})`, drawn by `vList`.
+- **Redemption log:** `GET /api/business/redemptions?staffId=owner|<id>&from&to` (newest first, max 300) shows who entered each one.
+- **Staff statuses:** `invited | accepted | suspended | cancelled` (legacy `removed` is hidden). Actions on
+  `POST /api/business/staff/:id`: `suspend | reinstate | cancel` (alias `remove`) `| reinvite | new_device | location`.
+  `cancel` keeps the row and all stats (audit trail), kills the invite and bumps `tokenVer` so the old phone token stops
+  working immediately. `new_device` (lost phone) bumps `tokenVer` and issues a fresh invite for the same person.
+  `reinvite` on a cancelled person makes a new invite. Cancelled people do not count toward the team limit.
+- **Abuse flags (`staffRows`):** "High volume" = 5+ redemptions and at least 2x the average of everyone else; "Big discounts" =
+  5+ redemptions and discounts above 35% of purchase totals. Only nudges, shown as ⚑ badges plus each person's share of all redemptions.
+- **Share-to-upgrade:** `friendsNeeded` 1 to 10; `upgradedType` is `percent|amount` (defaults to the deal's type). Same type
+  must be larger than the deal; a different type skips that check. `upgradedType(d)` is the helper. Also shared by Edit Deal.
+- **Emoji icons:** any emoji is accepted. `firstEmoji()` keeps one whole grapheme (flags, family, skin-tone, ZWJ). The UI has
+  `emojiFieldHtml/bindEmoji` in ui.js: a typed/pasted field plus a "Choose an emoji" panel. Used at signup and in the profile.
+- **`POST /api/share`** records that a pass was shared (`sharedAt`).
+- After engine/seed changes regenerate `worker/worker-single-file.js`; bump `CACHE` in `docs/sw.js` (now `localhints-v5`).
+- `node --check file.js` treats files as CommonJS and misses ES-module template errors. Copy to a `.mjs` first, or open the page.
+
 ## Settings (Worker, not committed)
 
 `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `ALLOWED_ORIGIN`, `SITE_URL`, `RESEND_API_KEY`, `EMAIL_FROM`, `ADMIN_EMAIL`,
@@ -136,3 +169,14 @@ close the account.
   index, strip imports/exports) and bump `CACHE` in `docs/sw.js` when site files change.
 - Test: `node tests/engine.test.mjs`; browser test: `cd docs && python3 -m http.server 8123` then `python3 tests/browser_e2e.py`.
 - Never leave TODO stubs.
+
+## V7 additions (Favorites)
+
+- **Heart is a toggle** (`toggleHeart` in consumer.js): empty heart = `POST /api/claim` (pass goes to My Deals), red heart =
+  `POST /api/unsave {dealId, consumerId}` (pass removed). A pass already used at the shop cannot be unsaved (400). Tapping the
+  box itself (`openDeal`): saved deal opens its pass, otherwise the deal details.
+- **Nav:** the old Wallet tab is now **Favorites** with a heart icon (tab id is still `wallet`, so `?tab=wallet` links keep working).
+  The page title is **My Deals**.
+- **Map:** a business pin gets a red outline when any of its deals is hearted (white otherwise). The Leaflet popup lists each
+  deal with a heart (`.popheart`, ~30px, about the size of Leaflet's close X). Toggling redraws the pins and reopens the popup.
+- Tests: `tests/map_stub_e2e.py` checks the popup heart and pin outline with a stand-in for Leaflet (the real library needs internet).
