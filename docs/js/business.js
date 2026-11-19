@@ -4,19 +4,27 @@ import { CATEGORIES, EVENT_LABELS, LIMITS, PILOT, PRICE, DEMO_CENTER, UNLIMITED 
 import { DEMO_LOGINS, DEMO_PASSWORD } from './seed.js';
 import {
   esc, toast, openSheet, closeSheet, confirmSheet, guard, fmtDate, fmtDateTime, ago, pct, money, dateInput, fromDateInput,
-  getBrowserLocation, registerServiceWorker, avatar, catLabel, timeLeft, qrSvg, installButtonHtml, settingsButtonHtml, bindChrome,
+  getBrowserLocation, registerServiceWorker, avatar, catLabel, timeLeft, qrSvg, installButtonHtml, settingsButtonHtml, bindChrome, emojiFieldHtml, bindEmoji,
 } from './ui.js';
 import { initNav, navigate, replaceScreen } from './nav.js';
 import { lineChart, pairBars } from './charts.js';
 import { mountRedeem } from './redeem-ui.js';
 
 const root = document.getElementById('app');
-const S = { token: tget(), me: null, tab: 'overview', health: { addressCheck: false }, analytics: null, partners: [], authMode: 'signup' };
+const S = { token: tget(), me: null, tab: 'overview', list: '', listPeriod: 'all', dealPeriod: 'all', logPeriod: 'all', logWho: '', health: { addressCheck: false }, analytics: null, partners: [], authMode: 'signup' };
 function tget() { try { return localStorage.getItem('lh:biz-token') || ''; } catch { return ''; } }
 function tset(v) { try { v ? localStorage.setItem('lh:biz-token', v) : localStorage.removeItem('lh:biz-token'); } catch { /* storage blocked */ } S.token = v; }
 
 const biz = () => S.me.business;
 const isPro = () => biz().effectiveTier === 'pro';
+// date ranges shared by the Deals page, the redemptions list and the redemption log
+const PERIODS = [['all', 'All deals'], ['week', 'Past week'], ['prevweek', 'Previous week'], ['month', 'Past month'], ['prevmonth', 'Previous month']];
+const DAY_MS = 86400000;
+function periodRange(k, now = Date.now()) {
+  return ({ week: [now - 7 * DAY_MS, now], prevweek: [now - 14 * DAY_MS, now - 7 * DAY_MS], month: [now - 30 * DAY_MS, now], prevmonth: [now - 60 * DAY_MS, now - 30 * DAY_MS] })[k] || [0, now + DAY_MS];
+}
+const periodSelectHtml = (id, val, label = 'Show') => `<label class="row small muted">${esc(label)} <select class="input" id="${id}" style="width:auto;min-height:36px;padding:4px 10px">${PERIODS.map(([k, l]) => `<option value="${k}" ${val === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>`;
+const PERIOD_NOTE = 'Past week = the last 7 days. Previous week = the 7 days before that. Past month = the last 30 days. Previous month = the 30 days before that.';
 const lim = (n) => (n >= UNLIMITED ? 'unlimited' : n);
 
 async function call(method, path, body) {
@@ -103,6 +111,7 @@ function authScreen() {
       ${signup ? `<div class="card stack"><h3>Your business</h3>
         <label class="field"><span class="lbl">Business name</span><input class="input" name="name" required maxlength="60"></label>
         <label class="field"><span class="lbl">Category</span><select class="input" name="category">${CATEGORIES.map((c) => `<option value="${c.id}">${c.emoji} ${esc(c.label)}</option>`).join('')}</select></label>
+        ${emojiFieldHtml('', 'Map icon (optional)')}
         <div id="addrBox">${addressBlock(a)}</div>
         <label class="field"><span class="lbl">One-line description (optional)</span><input class="input" name="blurb" maxlength="120"></label></div>
         <p class="small muted">You start on <b>Free Starter</b> (${LIMITS.free.dealsPerMonth} deals and ${LIMITS.free.savesPerMonth} wallet saves a month). We draft your first deal for you to edit, and an admin reviews new businesses before deals go live.</p>` : ''}
@@ -117,7 +126,7 @@ function authScreen() {
   root.querySelectorAll('[data-mode]').forEach((b) => (b.onclick = () => navigate({ auth: b.dataset.mode })));
   const fg = root.querySelector('#forgot');
   if (fg) fg.onclick = () => forgotSheet(root.querySelector('#authForm').email.value);
-  if (signup) bindAddress(root.querySelector('#addrBox'), a);
+  if (signup) { bindAddress(root.querySelector('#addrBox'), a); bindEmoji(root.querySelector('#authForm')); }
   root.querySelectorAll('[data-demo]').forEach((b) => (b.onclick = () => { const f = root.querySelector('#authForm'); f.email.value = b.dataset.demo; f.password.value = DEMO_PASSWORD; }));
   root.querySelector('#authForm').onsubmit = (e) => {
     e.preventDefault();
@@ -196,7 +205,7 @@ function dashboard() {
       <div id="view"></div></main>`;
   chrome();
   root.querySelector('#out').onclick = () => { tset(''); S.me = null; S.authMode = 'signin'; replaceScreen({ auth: 'signin' }); authScreen(); };
-  root.querySelectorAll('[data-tab]').forEach((t) => (t.onclick = () => { if (S.tab === t.dataset.tab) return; goTab(t.dataset.tab); }));
+  root.querySelectorAll('[data-tab]').forEach((t) => (t.onclick = () => { if (S.tab === t.dataset.tab && !S.list) return; goTab(t.dataset.tab); }));
   ({ overview: vOverview, deals: vDeals, team: vTeam, reach: vReach, loop: vLoop, insights: vInsights, account: vAccount })[S.tab](root.querySelector('#view'));
 }
 const statusBadge = (s) => `<span class="badge ${{ approved: 'b-good', pending: 'b-warn', suspended: 'b-bad', closed: 'b-bad' }[s]}">${{ approved: 'Approved', pending: 'Waiting for approval', suspended: 'Suspended', closed: 'Closed' }[s]}</span>`;
@@ -221,6 +230,7 @@ function meter(used, max) {
   return max >= UNLIMITED ? '' : `<div class="meter mt"><i style="width:${Math.min(100, (used / max) * 100)}%"></i></div>`;
 }
 function vOverview(v) {
+  if (S.list) return vList(v, S.list);
   const b = biz(), u = b.usage, l = b.limits;
   const concierge = S.me.deals.find((d) => d.isConcierge && d.status === 'draft');
   const live = S.me.deals.filter((d) => d.live).length;
@@ -236,17 +246,44 @@ function vOverview(v) {
     ${incoming.map((l2) => `<div class="card stack"><b>🔁 ${esc(l2.from.name)} wants to loop in with you</b><p>Their customers who redeem “${esc(l2.fromDealTitle)}” would get: <b>${esc(l2.rewardText)}</b> at your shop.</p>
       <div class="row"><button class="btn btn-primary grow" data-loop="${esc(l2.id)}" data-act="accept">Accept</button><button class="btn grow" data-loop="${esc(l2.id)}" data-act="decline">Decline</button></div></div>`).join('')}
     <div class="stats">
-      <div class="stat"><b>${live}</b><span>Live deals</span></div>
-      <div class="stat"><b>${u.saves}</b><span>Wallet saves this month${l.savesPerMonth < UNLIMITED ? ` (limit ${l.savesPerMonth})` : ''}${meter(u.saves, l.savesPerMonth)}</span></div>
-      <div class="stat"><b>${u.dealsPublished}</b><span>Deals published this month (${lim(l.dealsPerMonth)})${meter(u.dealsPublished, l.dealsPerMonth)}</span></div>
-      <div class="stat"><b>${S.me.deals.reduce((n, d) => n + d.metrics.redemptions, 0)}</b><span>Total redemptions</span></div></div>
+      <button class="stat statbtn" data-list="live" aria-label="Show the live deals"><b class="lnk">${live}</b><span>Live deals</span></button>
+      <button class="stat statbtn" data-list="saves" aria-label="Show this month's wallet saves"><b class="lnk">${u.saves}</b><span>Wallet saves this month${l.savesPerMonth < UNLIMITED ? ` (limit ${l.savesPerMonth})` : ''}${meter(u.saves, l.savesPerMonth)}</span></button>
+      <button class="stat statbtn" data-list="published" aria-label="Show the deals published this month"><b class="lnk">${u.dealsPublished}</b><span>Deals published this month (${lim(l.dealsPerMonth)})${meter(u.dealsPublished, l.dealsPerMonth)}</span></button>
+      <button class="stat statbtn" data-list="redemptions" aria-label="Show every redeemed deal"><b class="lnk">${S.me.deals.reduce((n, d) => n + d.metrics.redemptions, 0)}</b><span>Total redemptions</span></button></div>
     <div class="card stack"><h2>Redeem a pass</h2><p class="muted small">Enter the customer’s pass code and what they are buying. We work out the price after the deal and record both, so your results are real. Your team can do this too: see the <b>Team</b> tab.</p>
       <div id="redeemBox"></div></div>
   </div>`;
+  v.querySelectorAll('[data-list]').forEach((x) => (x.onclick = () => navigate({ tab: 'overview', list: x.dataset.list })));
   v.querySelectorAll('[data-edit]').forEach((x) => (x.onclick = () => dealForm(S.me.deals.find((d) => d.id === x.dataset.edit))));
   v.querySelectorAll('[data-pub]').forEach((x) => (x.onclick = () => guard(x, () => publishNow(x.dataset.pub))));
   v.querySelectorAll('[data-loop]').forEach((x) => (x.onclick = () => guard(x, () => loopAction(x.dataset.loop, x.dataset.act))));
   mountRedeem(v.querySelector('#redeemBox'), { locations: b.locations, send: (body) => call('POST', '/api/business/redeem', body), onDone: () => { reload(); } });
+}
+const LIST_TITLES = {
+  live: ['Live deals', 'Oldest first'], published: ['Deals published this month', 'Oldest first'],
+  saves: ['Wallet saves this month', 'Oldest saved first'], redemptions: ['Redeemed deals', 'Most redeemed first'],
+};
+async function vList(v, kind) {
+  const [title, order] = LIST_TITLES[kind] || ['', ''];
+  const [from, to] = periodRange(S.listPeriod);
+  v.innerHTML = `<div class="stack-lg"><div class="row between wrap"><button class="btn btn-sm" id="back">← Overview</button>${kind === 'redemptions' ? periodSelectHtml('lp', S.listPeriod) : ''}</div>
+    <div><h2>${esc(title)}</h2><p class="muted small mt">${esc(order)}${kind === 'redemptions' ? '. ' + esc(PERIOD_NOTE) : ''}</p></div><div id="lbody"><div class="spinner">Loading…</div></div></div>`;
+  v.querySelector('#back').onclick = () => { if (history.state && history.state.list) history.back(); else navigate({ tab: 'overview' }); };
+  const lp = v.querySelector('#lp');
+  if (lp) lp.onchange = () => { S.listPeriod = lp.value; vList(v, kind); };
+  let r;
+  try { r = await call('GET', '/api/business/report', { kind, ...(kind === 'redemptions' ? { from, to } : {}) }); } catch (e) { return (v.querySelector('#lbody').innerHTML = `<div class="err">${esc(e.message)}</div>`); }
+  if (S.list !== kind) return;
+  const body = v.querySelector('#lbody');
+  if (!r.rows.length) { body.innerHTML = '<div class="empty"><div class="big">📭</div><p>Nothing here yet.</p></div>'; return; }
+  const dealCells = (d) => `<td class="first"><b>${esc(d.title)}</b><div class="small muted">${esc(d.label)}</div></td>`;
+  if (kind === 'live' || kind === 'published') {
+    body.innerHTML = `<div class="tablewrap"><table class="t cards"><thead><tr><th>Deal</th><th>${kind === 'live' ? 'Started' : 'Published'}</th><th>Ends</th><th>Views</th><th>Saves</th><th>Redeemed</th></tr></thead><tbody>${r.rows.map((d) => `<tr>${dealCells(d)}<td data-label="${kind === 'live' ? 'Started' : 'Published'}">${esc(fmtDateTime(kind === 'live' ? d.startsAt : d.publishedAt))}</td><td data-label="Ends">${esc(fmtDate(d.endsAt))}</td><td data-label="Views">${d.views}</td><td data-label="Saves">${d.saves}</td><td data-label="Redeemed">${d.redemptions}</td></tr>`).join('')}</tbody></table></div>`;
+  } else if (kind === 'saves') {
+    body.innerHTML = `<div class="tablewrap"><table class="t cards"><thead><tr><th>Deal</th><th>Saved</th><th>Shared with friends?</th><th>Used?</th></tr></thead><tbody>${r.rows.map((p) => `<tr><td class="first"><b>${esc(p.dealTitle)}</b><div class="small muted">Pass ${esc(p.code)}</div></td><td data-label="Saved">${esc(fmtDateTime(p.savedAt))}</td><td data-label="Shared">${p.shared ? `Yes${p.sharedAt ? ' · ' + esc(fmtDateTime(p.sharedAt)) : ''}${p.friendSaves ? ` · ${p.friendSaves} friend${p.friendSaves > 1 ? 's' : ''} saved it` : ''}` : 'No'}</td><td data-label="Used">${p.redeemed ? 'Redeemed' : 'Not yet'}</td></tr>`).join('')}</tbody></table></div>`;
+  } else {
+    body.innerHTML = `<div class="tablewrap"><table class="t cards"><thead><tr><th>Deal</th><th>Redeemed</th><th>Purchases before</th><th>After deal</th><th>Ran</th></tr></thead><tbody>${r.rows.map((d) => `<tr>${dealCells(d)}<td data-label="Redeemed"><b>${d.redemptions}</b></td><td data-label="Before">${dollars(d.before)}</td><td data-label="After">${dollars(d.after)}</td><td data-label="Ran">${esc(fmtDate(d.startsAt))} to ${esc(fmtDate(d.endsAt))}</td></tr>`).join('')}</tbody></table></div>`;
+  }
 }
 async function publishNow(id) {
   try {
@@ -268,8 +305,12 @@ async function loopAction(id, action) {
 // ---------------------------------------------------------------- deals
 
 function vDeals(v) {
-  const ds = S.me.deals;
+  const all = S.me.deals;
+  const [pf, pt] = periodRange(S.dealPeriod);
+  // a deal "belongs" to a period if it was running at any time in it (drafts only show under All deals)
+  const ds = S.dealPeriod === 'all' ? all : all.filter((d) => d.status !== 'draft' && d.startsAt < pt && d.endsAt > pf);
   v.innerHTML = `<div class="row between"><h2>Your deals</h2><button class="btn btn-primary btn-sm" id="new">+ New deal</button></div>
+    <div class="mt">${periodSelectHtml('dp', S.dealPeriod, 'Show deals from')}${S.dealPeriod === 'all' ? '' : `<p class="hint">Deals that were running at some point in this time. ${esc(PERIOD_NOTE)}</p>`}</div>
     <div class="stack mt">${ds.length ? ds.map((d) => `<div class="card stack">
       <div class="row between"><div class="grow"><div class="row wrap" style="gap:6px">${dealBadge(d)}<span class="badge b-brand">${esc(d.label)}</span>${d.isConcierge ? '<span class="badge">Suggested</span>' : ''}${d.stamps > 1 ? `<span class="badge">${d.stamps}-stamp card</span>` : ''}</div>
         <h3 class="mt">${esc(d.title)}</h3><div class="small muted">${esc(fmtDate(d.startsAt))} to ${esc(fmtDate(d.endsAt))}</div></div></div>
@@ -280,7 +321,8 @@ function vDeals(v) {
         ${d.status === 'live' ? `<button class="btn btn-sm" data-st="${esc(d.id)}" data-to="paused">Pause</button>` : ''}
         ${d.status === 'paused' ? `<button class="btn btn-sm btn-primary" data-st="${esc(d.id)}" data-to="live">Resume</button>` : ''}
         ${['live', 'paused'].includes(d.status) ? `<button class="btn btn-sm btn-danger" data-st="${esc(d.id)}" data-to="ended">End now</button>` : ''}
-      </div></div>`).join('') : '<div class="empty"><div class="big">🏷️</div><p>No deals yet.</p></div>'}</div>`;
+      </div></div>`).join('') : `<div class="empty"><div class="big">🏷️</div><p>${all.length ? 'No deals in this time.' : 'No deals yet.'}</p></div>`}</div>`;
+  v.querySelector('#dp').onchange = (e) => { S.dealPeriod = e.target.value; vDeals(v); };
   v.querySelector('#new').onclick = () => dealForm(null);
   v.querySelectorAll('[data-edit]').forEach((x) => (x.onclick = () => dealForm(ds.find((d) => d.id === x.dataset.edit))));
   v.querySelectorAll('[data-pub]').forEach((x) => (x.onclick = () => guard(x, () => publishNow(x.dataset.pub))));
@@ -330,8 +372,8 @@ function dealForm(d) {
         </div>
         <label class="check"><input type="checkbox" id="upOn" ${up ? 'checked' : ''}> Share-to-upgrade (% or $ off only)</label>
         <div class="grid2 ${up ? '' : 'hide'}" id="upBox">
-          <label class="field"><span class="lbl">Friends needed</span><select class="input" name="friendsNeeded">${[1, 2, 3].map((n) => `<option ${up && up.friendsNeeded === n ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
-          <label class="field"><span class="lbl">Upgraded offer</span><input class="input" name="upgradedValue" type="number" min="1" value="${up ? esc(up.upgradedValue) : ''}"></label>
+          <label class="field"><span class="lbl">Friends needed</span><select class="input" name="friendsNeeded">${Array.from({ length: 10 }, (_, i) => i + 1).map((n) => `<option ${up && up.friendsNeeded === n ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+          <div class="field"><span class="lbl">Upgraded offer</span><div class="row" style="gap:8px"><input class="input grow" name="upgradedValue" type="number" min="1" step="1" inputmode="decimal" value="${up ? esc(up.upgradedValue) : ''}" aria-label="Upgraded amount"><select class="input" name="upgradedType" style="width:auto" aria-label="Percent or dollars"><option value="percent" ${((up && up.upgradedType) || (d && d.type) || 'percent') === 'percent' ? 'selected' : ''}>% off</option><option value="amount" ${((up && up.upgradedType) || (d && d.type)) === 'amount' ? 'selected' : ''}>$ off</option></select></div></div>
         </div></div>` : `<div class="card flat stack"><b>🔒 Pro options</b><p class="small muted">Buy-one-get-one and free-item deals, custom end dates, minimum spend, claim limits, punch cards, share-to-upgrade, your own logo and pass color.</p><button type="button" class="btn btn-sm" data-upgrade>See Pro</button></div>`}
       <div id="dfErr"></div>
       <div class="row wrap">
@@ -364,7 +406,7 @@ function dealForm(d) {
       body.claimCap = Number(f.claimCap) || 0;
       body.stamps = Number(f.stamps);
       body.color = f.color;
-      body.upgrade = upOn.checked ? { friendsNeeded: Number(f.friendsNeeded), upgradedValue: Number(f.upgradedValue) } : null;
+      body.upgrade = upOn.checked ? { friendsNeeded: Number(f.friendsNeeded), upgradedValue: Number(f.upgradedValue), upgradedType: f.upgradedType } : null;
     }
     if (wantPublish && (!d || d.status === 'draft')) body.publish = true;
     guard(e.submitter, async () => {
@@ -476,10 +518,17 @@ async function loopForm() {
 // ---------------------------------------------------------------- team (staff / clerks) + how redemption works
 
 const METHOD = { qr: 'QR code', sms: 'Text message', email: 'Email' };
-const STAFF_BADGE = { invited: 'b-warn', accepted: 'b-good', suspended: 'b-bad' };
+const STAFF_BADGE = { invited: 'b-warn', accepted: 'b-good', suspended: 'b-bad', cancelled: 'b' };
 const dollars = (n) => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const absUrl = (path) => new URL(path, location.href).href;
 
+function staffButtons(r) {
+  const b = (a, label, cls = '') => `<button class="btn btn-sm ${cls}" data-sa="${a}" data-sid="${esc(r.id)}">${label}</button>`;
+  if (r.status === 'invited') return b('reinvite', 'Show link / QR') + b('cancel', 'Cancel invite', 'btn-danger');
+  if (r.status === 'accepted') return b('suspend', 'Suspend') + b('new_device', 'Lost phone') + b('cancel', 'Cancel access', 'btn-danger');
+  if (r.status === 'suspended') return b('reinstate', 'Reinstate', 'btn-primary') + b('cancel', 'Cancel access', 'btn-danger');
+  return b('reinvite', 'Invite again');
+}
 async function vTeam(v) {
   v.innerHTML = '<div class="spinner">Loading…</div>';
   let t;
@@ -501,21 +550,40 @@ async function vTeam(v) {
       <button class="btn btn-primary" id="inv" ${b.status === 'approved' ? '' : 'disabled'}>+ Invite a team member</button>
       ${b.status === 'approved' ? '' : '<p class="hint">You can invite people once your account is approved.</p>'}
       <div class="tablewrap"><table class="t cards"><thead><tr><th>Team member</th><th>Invited by</th><th>Status</th><th>Redeemed</th><th>Purchases before deals</th><th>After deals (calculated)</th><th></th></tr></thead><tbody>
-      <tr><td class="first"><b>You (owner)</b></td><td data-label="Invited by">—</td><td data-label="Status"><span class="badge b-good">Owner</span></td><td data-label="Redeemed">${t.owner.redemptions}</td><td data-label="Before">${dollars(t.owner.before)}</td><td data-label="After">${dollars(t.owner.after)}</td><td></td></tr>
-      ${rows.map((r) => `<tr><td class="first"><b>${esc(r.name)}</b>${multi ? `<div class="small muted">${esc(r.locationName)}</div>` : ''}</td>
+      <tr><td class="first"><b>You (owner)</b></td><td data-label="Invited by">—</td><td data-label="Status"><span class="badge b-good">Owner</span></td><td data-label="Redeemed">${t.owner.redemptions}<div class="tiny muted">${Math.round(t.owner.share * 100)}% of all</div></td><td data-label="Before">${dollars(t.owner.before)}</td><td data-label="After">${dollars(t.owner.after)}</td><td></td></tr>
+      ${rows.map((r) => `<tr${r.status === 'cancelled' ? ' style="opacity:.6"' : ''}><td class="first"><b>${esc(r.name)}</b>${r.flags.map((f) => ` <span class="badge b-bad" title="Worth a look: ${esc(f)}">⚑ ${esc(f)}</span>`).join('')}${multi ? `<div class="small muted">${esc(r.locationName)}</div>` : ''}</td>
         <td data-label="Invited by"><b>${esc(METHOD[r.method])}</b>${r.contact ? `<div class="small muted">${esc(r.contact)}</div>` : ''}</td>
         <td data-label="Status"><span class="badge ${STAFF_BADGE[r.status]}">${r.status[0].toUpperCase() + r.status.slice(1)}</span>${r.status === 'invited' && !r.inviteOpen ? '<div class="tiny muted">link expired</div>' : ''}</td>
-        <td data-label="Redeemed">${r.redemptions}</td><td data-label="Before">${dollars(r.before)}</td><td data-label="After">${dollars(r.after)}</td>
-        <td><div class="row wrap" style="justify-content:flex-end">${r.status === 'invited' ? `<button class="btn btn-sm" data-sa="reinvite" data-sid="${esc(r.id)}">Show link / QR</button>` : ''}${r.status === 'accepted' ? `<button class="btn btn-sm" data-sa="suspend" data-sid="${esc(r.id)}">Suspend</button>` : ''}${r.status === 'suspended' ? `<button class="btn btn-sm btn-primary" data-sa="reinstate" data-sid="${esc(r.id)}">Reinstate</button>` : ''}<button class="btn btn-sm btn-danger" data-sa="remove" data-sid="${esc(r.id)}">Remove</button></div></td></tr>`).join('')}
+        <td data-label="Redeemed">${r.redemptions}<div class="tiny muted">${Math.round(r.share * 100)}% of all</div></td><td data-label="Before">${dollars(r.before)}</td><td data-label="After">${dollars(r.after)}</td>
+        <td><div class="row wrap" style="justify-content:flex-end">${staffButtons(r)}</div></td></tr>`).join('')}
       <tr><td class="first"><b>Everyone</b></td><td></td><td></td><td data-label="Redeemed"><b>${sum('redemptions')}</b></td><td data-label="Before"><b>${dollars(sum('before'))}</b></td><td data-label="After"><b>${dollars(sum('after'))}</b></td><td></td></tr>
       </tbody></table></div>
-      <p class="hint">“After deals” is the price the customer paid once the deal was applied. For % off, $ off and bundle deals it is calculated exactly; for buy-one-get-one and free-item deals it is an estimate unless the amount charged was entered.</p></div></div>`;
+      <p class="hint"><b>⚑ flags</b> are only a nudge to look closer, never proof. “High volume” means someone redeemed at least twice as many passes as the others (5 or more). “Big discounts” means their redemptions took off more than 35% of the purchase totals. Use the log below to see exactly what they rang up.</p>
+      <p class="hint">“After deals” is the price the customer paid once the deal was applied. For % off, $ off and bundle deals it is calculated exactly; for buy-one-get-one and free-item deals it is an estimate unless the amount charged was entered.</p></div>
+    <div class="card stack"><h2>Redemption log</h2><p class="small muted">Every redemption and who entered it. Look for one person redeeming far more than the rest, or lots of redemptions with no purchase total. ${esc(PERIOD_NOTE)}</p>
+      <div class="row wrap">${periodSelectHtml('lgp', S.logPeriod, 'When')}<label class="row small muted">Who <select class="input" id="lgw" style="width:auto;min-height:36px;padding:4px 10px"><option value="">Everyone</option><option value="owner" ${S.logWho === 'owner' ? 'selected' : ''}>Owner</option>${rows.map((r) => `<option value="${esc(r.id)}" ${S.logWho === r.id ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}</select></label></div>
+      <div id="logBody"><div class="spinner">Loading…</div></div></div></div>`;
+  const loadLog = async () => {
+    const [from, to] = periodRange(S.logPeriod);
+    const box = v.querySelector('#logBody');
+    try {
+      const r = await call('GET', '/api/business/redemptions', { from, to, ...(S.logWho ? { staffId: S.logWho } : {}) });
+      box.innerHTML = r.rows.length ? `<div class="tablewrap"><table class="t cards"><thead><tr><th>When</th><th>Deal</th><th>Entered by</th><th>Pass</th><th>Before</th><th>After</th></tr></thead><tbody>${r.rows.map((x) => `<tr><td class="first">${esc(fmtDateTime(x.at))}</td><td data-label="Deal">${esc(x.dealTitle)}</td><td data-label="By"><b>${esc(x.by)}</b>${multi ? `<div class="tiny muted">${esc(x.locationName)}</div>` : ''}</td><td data-label="Pass">${esc(x.code)}</td><td data-label="Before">${dollars(x.before)}</td><td data-label="After">${dollars(x.after)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted small">No redemptions in this time.</p>';
+    } catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  };
+  v.querySelector('#lgp').onchange = (e) => { S.logPeriod = e.target.value; loadLog(); };
+  v.querySelector('#lgw').onchange = (e) => { S.logWho = e.target.value; loadLog(); };
+  loadLog();
   v.querySelector('#inv').onclick = () => inviteForm(t);
   v.querySelectorAll('[data-sa]').forEach((x) => (x.onclick = () => guard(x, async () => {
     const a = x.dataset.sa;
-    if (a === 'remove' && !(await confirmSheet('Remove this team member?', 'They will not be able to redeem passes any more. Their past redemptions stay in your numbers.', 'Remove', true))) return;
+    const ask = {
+      cancel: ['Cancel this team member?', 'Use this when someone leaves or loses their phone. Their phone stops working right away and the invite link dies. Their past redemptions stay in your numbers, and you can invite them again later.', 'Cancel access'],
+      new_device: ['Lost phone or new phone?', 'The old phone stops working right away. We make a fresh link for the same person to open on their new phone.', 'Make a new link'],
+    }[a];
+    if (ask && !(await confirmSheet(ask[0], ask[1], ask[2], a === 'cancel'))) return;
     const r = await call('POST', `/api/business/staff/${x.dataset.sid}`, { action: a });
-    if (a === 'reinvite') return showInvite(r);
+    if (a === 'reinvite' || a === 'new_device') return showInvite(r);
     toast('Done.');
     vTeam(v);
   })));
@@ -708,7 +776,7 @@ function vAccount(v) {
     <div class="card stack"><h2>Business profile</h2><form id="pf" class="stack" novalidate>
       <label class="field"><span class="lbl">Business name</span><input class="input" name="name" value="${esc(b.name)}" maxlength="60"></label>
       <label class="field"><span class="lbl">Description</span><input class="input" name="blurb" value="${esc(b.blurb || '')}" maxlength="120"></label>
-      <label class="field"><span class="lbl">Icon (emoji)</span><input class="input" name="emoji" value="${esc(b.emoji)}" maxlength="4" style="width:90px"></label>
+      ${emojiFieldHtml(b.emoji, 'Icon')}
       <div id="addrBox">${addressBlock(a)}</div>
       <div class="small muted">${b.addressVerified ? '✅ Address verified with Google' : 'Address not verified yet'}</div><div id="pfOut"></div>
       <button class="btn btn-primary">Save profile</button></form></div>
@@ -718,6 +786,7 @@ function vAccount(v) {
     <div class="card stack"><h2>Close account</h2><p class="small muted">Ends all your deals and removes your shop from the app. You will need to contact LocalHints to reopen it.</p><button class="btn btn-danger" id="close">Close my account</button></div></div>`;
   bindUpgrade(v);
   bindAddress(v.querySelector('#addrBox'), a);
+  bindEmoji(v.querySelector('#pf'));
   const plan = (tier, billing) => (e) => guard(e.currentTarget, async () => {
     const r = await call('POST', '/api/business/tier', { tier, billing });
     if (r.requested) v.querySelector('#planOut').innerHTML = `<div class="okmsg">${esc(r.message)}</div>`;
@@ -808,7 +877,7 @@ async function boot() {
   const params = new URLSearchParams(location.search);
   const resetTok = params.get('reset');
   initNav(S.token ? { tab: 'overview' } : { auth: S.authMode }, (st) => {
-    if (S.me) { S.tab = st.tab || 'overview'; dashboard(); } else { S.authMode = st.auth || 'signin'; authScreen(); }
+    if (S.me) { S.tab = st.tab || 'overview'; S.list = st.list || ''; dashboard(); } else { S.authMode = st.auth || 'signin'; authScreen(); }
   });
   try { S.health = await api.get('/api/health'); } catch (e) {
     root.innerHTML = `${bar()}<main class="page"><div class="empty"><div class="big">📡</div><p>${esc(e.message)}</p></div></main>`;

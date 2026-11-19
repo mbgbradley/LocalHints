@@ -260,3 +260,33 @@ table.t tr.clickable { cursor: pointer; } table.t tr.clickable:hover td { backgr
 .qrbox svg { width: 100%; height: auto; display: block; }
 .big-input { font-size: 22px; min-height: 56px; text-align: center; letter-spacing: 0.08em; }
 @media (min-width: 700px) { .stats.four-up { grid-template-columns: repeat(4, 1fr); } }
+
+/* ---- deal cards with a heart, and the three equal filter dropdowns */
+.deal { position: relative; }
+.deal .grow { padding-right: 34px; }
+.heart { position: absolute; right: 8px; bottom: 8px; width: 44px; height: 44px; border-radius: 50%; border: 0; background: transparent; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; padding: 0; }
+.heart:active { transform: scale(0.9); }
+.heart.on { color: #e11d48; }
+.heart.on .ico-svg { fill: #e11d48; stroke: #e11d48; }
+.fbar { position: relative; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.fbar.two { grid-template-columns: repeat(2, 1fr); }
+.fbtn { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 3px; padding: 9px 4px; min-height: 42px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); font-size: 13px; font-weight: 700; }
+.fbtn span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fbtn[data-on='1'] { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
+.fbtn[aria-expanded='true'] { border-color: var(--brand); }
+.fmenu { position: absolute; top: 48px; z-index: 40; min-width: 210px; max-width: calc(100vw - 32px); max-height: 60vh; overflow-y: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.18); padding: 6px; }
+.fmenu button { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; text-align: left; padding: 11px 12px; border: 0; background: none; border-radius: 10px; font-size: 15px; color: var(--ink); }
+.fmenu button[aria-checked='true'] { background: var(--brand-soft); color: var(--brand); font-weight: 700; }
+.fmenu button:hover { background: var(--brand-soft); }
+.emojigrid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; }
+.emojigrid button { font-size: 24px; padding: 6px 0; border: 0; background: none; border-radius: 8px; }
+.emojigrid button:hover, .emojigrid button:focus-visible { background: var(--brand-soft); }
+.stat .lnk { text-decoration: underline; text-underline-offset: 4px; color: var(--brand); }
+.statbtn:hover .lnk { text-decoration-thickness: 2px; }
+@media (max-width: 380px) { .fbtn { font-size: 12px; gap: 2px; padding: 9px 3px; } }
+/* V7: heart toggle inside the map popup (about the size of Leaflet's close X) */
+.popdeal { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
+.popdeal a { flex: 1; }
+.popheart { flex: none; width: 30px; height: 30px; border-radius: 50%; border: 0; background: transparent; color: #64748b; display: inline-flex; align-items: center; justify-content: center; padding: 0; cursor: pointer; }
+.popheart.on { color: #e11d48; }
+.popheart.on .ico-svg { fill: #e11d48; stroke: #e11d48; }

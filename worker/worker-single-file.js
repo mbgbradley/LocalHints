@@ -93,7 +93,7 @@ const EVENT_LABELS = {
   staff_accepted: 'Team member accepted',
   staff_suspended: 'Team member suspended',
   staff_reinstated: 'Team member reinstated',
-  staff_removed: 'Team member removed',
+  staff_removed: 'Team member cancelled',
   location_added: 'Location added',
   location_removed: 'Location removed',
   password_reset_requested: 'Password reset requested',
@@ -250,10 +250,14 @@ function isPilot(b, now) {
 function limitsFor(b, now) {
   return LIMITS[effectiveTier(b, now)];
 }
+/** The kind of discount a deal has once upgraded (% or $). Older deals saved before this option use the deal's own kind. */
+const upgradedType = (d) => (d.upgrade && d.upgrade.upgradedType) || d.type;
 function dealLabel(d, upgraded) {
-  const v = upgraded && d.upgrade ? d.upgrade.upgradedValue : d.value;
-  if (d.type === 'percent') return `${v}% OFF`;
-  if (d.type === 'amount') return `$${v} OFF`;
+  const up = !!(upgraded && d.upgrade);
+  const v = up ? d.upgrade.upgradedValue : d.value;
+  const t = up ? upgradedType(d) : d.type;
+  if (t === 'percent') return `${v}% OFF`;
+  if (t === 'amount') return `$${v} OFF`;
   if (d.type === 'bogo') return 'BUY 1 GET 1';
   if (d.type === 'freeitem') return 'FREE ITEM';
   return `$${d.value} BUNDLE`;
@@ -369,11 +373,13 @@ function normalizeDeal(biz, inp, now, existing) {
       if (type !== 'percent' && type !== 'amount') return { error: 'Share-to-upgrade works with % off and $ off deals.' };
       const fn = Math.floor(Number(up.friendsNeeded));
       const uv = Number(up.upgradedValue);
-      if (![1, 2, 3].includes(fn)) return { error: 'Friends needed must be 1, 2 or 3.' };
-      if (!isNum(uv) || uv <= value || (type === 'percent' && uv > 90) || (type === 'amount' && uv > 500)) {
-        return { error: 'The upgraded offer must be bigger than the starting offer.' };
+      const ut = up.upgradedType === 'percent' || up.upgradedType === 'amount' ? up.upgradedType : type;
+      if (!(fn >= 1 && fn <= 10)) return { error: 'Friends needed must be between 1 and 10.' };
+      if (!isNum(uv) || uv <= 0 || (ut === 'percent' && uv > 90) || (ut === 'amount' && uv > 500)) {
+        return { error: ut === 'percent' ? 'The upgraded offer must be between 1% and 90%.' : 'The upgraded offer must be between $1 and $500.' };
       }
-      upgrade = { friendsNeeded: fn, upgradedValue: uv };
+      if (ut === type && uv <= value) return { error: 'The upgraded offer must be bigger than the starting offer.' };
+      upgrade = { friendsNeeded: fn, upgradedValue: uv, upgradedType: ut };
     }
   }
   return { fields: { title, description, type, value, itemText, minSpend, startsAt, endsAt, claimCap, stamps, color, upgrade } };
@@ -671,6 +677,13 @@ async function routeView(c) {
   return ok({ ok: true });
 }
 
+async function routeShare(c) {
+  const p = c.state.passes.find((x) => x.id === clean(c.body.passId, 60) && x.consumerId === clean(c.body.consumerId, 60));
+  if (!p) return err('Pass not found.', 404);
+  if (!p.sharedAt) p.sharedAt = c.now;
+  return ok({ ok: true });
+}
+
 async function routeClaim(c) {
   const { state, now, body } = c;
   const consumerId = clean(body.consumerId, 60);
@@ -702,6 +715,19 @@ async function routeClaim(c) {
     }
   }
   return ok({ pass: passPublic(state, pass, now) });
+}
+
+// Un-hearting a deal removes its pass from the shopper's wallet. A pass that has already been used stays (it is part of the sales record).
+async function routeUnsave(c) {
+  const { state, body } = c;
+  const consumerId = clean(body.consumerId, 60);
+  if (!consumerId) return err('Missing shopper id.');
+  const i = state.passes.findIndex((p) => p.dealId === clean(body.dealId, 40) && p.consumerId === consumerId && p.kind === 'deal');
+  if (i < 0) return ok({ removed: false });
+  const p = state.passes[i];
+  if (p.stamps > 0 || state.redemptions.some((r) => r.passId === p.id)) return err('This pass was already used at the shop, so it stays in My Deals.');
+  state.passes.splice(i, 1);
+  return ok({ removed: true });
 }
 
 async function routePasses(c) {
@@ -803,7 +829,7 @@ async function routeSignup(c) {
     verified = true;
   }
   const hp = await hashPassword(body.password);
-  const emoji = clean(body.emoji, 8) || CATEGORIES.find((x) => x.id === category).emoji;
+  const emoji = firstEmoji(clean(body.emoji, 40)) || CATEGORIES.find((x) => x.id === category).emoji;
   const b = {
     id: uid('b'), email, ownerName, passSalt: hp.salt, passHash: hp.hash, name, category, emoji,
     address: formatted, addressRaw: address, addressVerified: verified, placeId, lat, lng, blurb: clean(body.blurb, 120),
@@ -873,7 +899,7 @@ async function routeProfile(c) {
   if (name !== b.name) changes.push('name');
   b.name = name;
   if (body.blurb !== undefined) { b.blurb = clean(body.blurb, 120); changes.push('description'); }
-  if (body.emoji !== undefined && clean(body.emoji, 8)) { b.emoji = clean(body.emoji, 8); changes.push('icon'); }
+  if (body.emoji !== undefined && firstEmoji(clean(body.emoji, 40))) { b.emoji = firstEmoji(clean(body.emoji, 40)); changes.push('icon'); }
   if (body.address !== undefined && clean(body.address, 160) !== b.address) {
     const address = clean(body.address, 160);
     if (address.length < 6) return err('Enter your street address.');
@@ -1311,6 +1337,17 @@ async function routeAdminReset(c) {
   return ok({ ok: true });
 }
 
+/** Keeps the first emoji (or character) a person typed, even long ones like flags or 👩‍🍳. */
+function firstEmoji(v) {
+  const t = String(v ?? '').trim();
+  if (!t) return '';
+  try {
+    const seg = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    for (const x of seg.segment(t)) return x.segment.slice(0, 16);
+  } catch { /* old browser: fall through */ }
+  return Array.from(t)[0] || '';
+}
+
 // ---------------------------------------------------------------- v5: email, locations, redemption math, staff
 
 const siteBase = (c) => String((c.ctx.env && c.ctx.env.SITE_URL) || c.ctx.siteBase || '').replace(/\/+$/, '');
@@ -1362,26 +1399,39 @@ function sumRedemptions(list) {
 }
 const money = (n) => Math.round(n * 100) / 100;
 
+const staffShown = (s) => s.status !== 'removed';
+const staffCounts = (s) => s.status !== 'removed' && s.status !== 'cancelled';
+
 function staffRows(state, b) {
   const reds = state.redemptions.filter((r) => r.bizId === b.id);
-  const rows = state.staff.filter((s) => s.bizId === b.id && s.status !== 'removed').sort((a, z) => z.createdAt - a.createdAt).map((s) => {
-    const t = sumRedemptions(reds.filter((r) => r.staffId === s.id));
+  const o = sumRedemptions(reds.filter((r) => !r.staffId));
+  const list = state.staff.filter((s) => s.bizId === b.id && staffShown(s));
+  const counts = list.map((s) => sumRedemptions(reds.filter((r) => r.staffId === s.id)));
+  const people = counts.length + 1;
+  const totalN = counts.reduce((n, t) => n + t.n, 0) + o.n;
+  const rows = list.map((s, i) => {
+    const t = counts[i];
+    const avgOthers = people > 1 ? (totalN - t.n) / (people - 1) : 0;
+    const disc = t.before - t.after;
+    const flags = [];
+    if (t.n >= 5 && avgOthers > 0 && t.n >= 2 * avgOthers) flags.push('High volume');
+    if (t.n >= 5 && t.before > 0 && disc / t.before > 0.35) flags.push('Big discounts');
     return {
       id: s.id, name: s.name, contact: s.contact, method: s.method, status: s.status, locationId: s.locationId || 'main',
-      locationName: locationName(b, s.locationId || 'main'), createdAt: s.createdAt, acceptedAt: s.acceptedAt || 0,
+      locationName: locationName(b, s.locationId || 'main'), createdAt: s.createdAt, acceptedAt: s.acceptedAt || 0, cancelledAt: s.cancelledAt || 0,
       inviteOpen: !!s.invite && s.inviteExpiresAt > Date.now(),
-      redemptions: t.n, before: money(t.before), after: money(t.after),
+      redemptions: t.n, before: money(t.before), after: money(t.after), discount: money(disc),
+      share: totalN ? t.n / totalN : 0, flags,
     };
-  });
-  const o = sumRedemptions(reds.filter((r) => !r.staffId));
-  return { staff: rows, owner: { redemptions: o.n, before: money(o.before), after: money(o.after) } };
+  }).sort((a, z) => (a.status === 'cancelled') - (z.status === 'cancelled') || z.createdAt - a.createdAt);
+  return { staff: rows, owner: { redemptions: o.n, before: money(o.before), after: money(o.after), discount: money(o.before - o.after), share: totalN ? o.n / totalN : 0 }, total: totalN };
 }
 
 async function authStaff(c) {
   const p = await readToken(c.ctx.secret, bearer(c.req), c.now);
   if (!p || p.role !== 'staff') return null;
   const s = c.state.staff.find((x) => x.id === p.id);
-  if (!s || s.status !== 'accepted') return null;
+  if (!s || s.status !== 'accepted' || (p.v || 0) !== (s.tokenVer || 0)) return null;
   const b = getBiz(c.state, s.bizId);
   return b && b.status === 'approved' ? { staff: s, biz: b } : null;
 }
@@ -1405,7 +1455,8 @@ async function doRedeem(c, biz, staff) {
     if (raw === undefined || raw === null || raw === '' || !Number.isFinite(Number(raw)) || Number(raw) <= 0 || Number(raw) > 100000) {
       return err('Enter the purchase total before the deal (for example 24.50).', 400, { needsAmount: true });
     }
-    calc = computeAfter(d, raw);
+    const upg = upgradedPass(d, p);
+    calc = computeAfter(upg ? { ...d, type: upgradedType(d), value: d.upgrade.upgradedValue } : d, raw);
     if (body.after !== undefined && body.after !== null && body.after !== '') {
       const a = Number(body.after);
       if (!Number.isFinite(a) || a < 0 || a > calc.before) return err('The final amount must be between $0 and the purchase total.');
@@ -1463,11 +1514,57 @@ async function routeStaffRedeem(c) {
 
 // ---------------------------------------------------------------- staff
 
+const periodBounds = (q, now) => ({ from: Math.max(0, Number(q.from) || 0), to: Number(q.to) > 0 ? Number(q.to) : now + DAY });
+
+// Lists behind the Overview numbers and the redemption log (owner only).
+async function routeReport(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, now, query: q } = c;
+  const { from, to } = periodBounds(q, now);
+  const mineDeals = state.deals.filter((d) => d.bizId === b.id);
+  const brief = (d) => ({ id: d.id, title: d.title, label: dealLabel(d), startsAt: d.startsAt, endsAt: d.endsAt, status: d.status, publishedAt: d.publishedAt || 0, ...dealMetrics(state, d) });
+  const kind = q.kind;
+  if (kind === 'live') return ok({ kind, rows: mineDeals.filter((d) => isLive(d, b, now)).sort((a, z) => a.startsAt - z.startsAt).map(brief) });
+  if (kind === 'published') return ok({ kind, rows: mineDeals.filter((d) => d.publishedAt && sameMonth(d.publishedAt, now)).sort((a, z) => a.publishedAt - z.publishedAt).map(brief) });
+  if (kind === 'saves') {
+    const rows = state.passes.filter((p) => p.bizId === b.id && p.kind === 'deal' && sameMonth(p.createdAt, now)).sort((a, z) => a.createdAt - z.createdAt).map((p) => {
+      const d = getDeal(state, p.dealId);
+      return { id: p.id, code: p.code, dealTitle: d ? d.title : '', savedAt: p.createdAt, shared: !!(p.sharedAt || p.friendSaves > 0), sharedAt: p.sharedAt || 0, friendSaves: p.friendSaves, redeemed: p.stamps > 0 };
+    });
+    return ok({ kind, rows });
+  }
+  if (kind === 'redemptions') {
+    const reds = state.redemptions.filter((r) => r.bizId === b.id && r.at >= from && r.at < to);
+    const rows = mineDeals.map((d) => {
+      const t = sumRedemptions(reds.filter((r) => r.dealId === d.id));
+      return { id: d.id, title: d.title, label: dealLabel(d), status: d.status, startsAt: d.startsAt, endsAt: d.endsAt, redemptions: t.n, before: money(t.before), after: money(t.after) };
+    }).filter((r) => r.redemptions > 0).sort((a, z) => z.redemptions - a.redemptions);
+    return ok({ kind, rows });
+  }
+  return err('Unknown list.');
+}
+
+// Every redemption with who rang it up, newest first. Optional: staffId ('owner' for the owner), from, to.
+async function routeRedemptionLog(c) {
+  const b = await authBiz(c);
+  if (!b) return NEED_LOGIN();
+  const { state, now, query: q } = c;
+  const { from, to } = periodBounds(q, now);
+  const names = new Map(state.staff.filter((s) => s.bizId === b.id).map((s) => [s.id, s.name]));
+  const rows = state.redemptions.filter((r) => r.bizId === b.id && r.at >= from && r.at < to && (!q.staffId || (q.staffId === 'owner' ? !r.staffId : r.staffId === q.staffId)))
+    .sort((a, z) => z.at - a.at).slice(0, 300).map((r) => {
+      const d = getDeal(state, r.dealId), p = state.passes.find((x) => x.id === r.passId);
+      return { id: r.id, at: r.at, dealTitle: d ? d.title : '', by: r.staffId ? names.get(r.staffId) || 'Former team member' : 'Owner', staffId: r.staffId || 'owner', locationName: locationName(b, r.locationId), code: p ? p.code : '', before: r.before, after: r.after };
+    });
+  return ok({ rows });
+}
+
 async function routeStaffList(c) {
   const b = await authBiz(c);
   if (!b) return NEED_LOGIN();
   const lim = limitsFor(b, c.now);
-  const active = c.state.staff.filter((s) => s.bizId === b.id && s.status !== 'removed').length;
+  const active = c.state.staff.filter((s) => s.bizId === b.id && staffCounts(s)).length;
   return ok({ ...staffRows(c.state, b), limit: lim.staff, used: active, locations: locationList(b) });
 }
 
@@ -1482,7 +1579,7 @@ async function routeStaffInvite(c) {
   if (name.length < 2) return err('Enter the team member\'s name.');
   if (method === 'email' && !validEmail(contact)) return err('Enter a valid email address.');
   if (method === 'sms' && contact.replace(/\D/g, '').length < 7) return err('Enter a mobile phone number.');
-  const used = state.staff.filter((s) => s.bizId === b.id && s.status !== 'removed').length;
+  const used = state.staff.filter((s) => s.bizId === b.id && staffCounts(s)).length;
   if (used >= limitsFor(b, now).staff) return err(`Your plan allows ${limitsFor(b, now).staff} team members.${effectiveTier(b, now) === 'free' ? ' Upgrade to Pro for more.' : ''}`);
   const locationId = validLocation(b, body.locationId) ? clean(body.locationId, 40) || 'main' : 'main';
   const s = {
@@ -1505,7 +1602,7 @@ async function routeStaffAction(c) {
   const b = await authBiz(c);
   if (!b) return NEED_LOGIN();
   const { state, body, now } = c;
-  const s = state.staff.find((x) => x.id === c.params.id && x.bizId === b.id && x.status !== 'removed');
+  const s = state.staff.find((x) => x.id === c.params.id && x.bizId === b.id && staffShown(x));
   if (!s) return err('Team member not found.', 404);
   const a = body.action;
   if (a === 'suspend') {
@@ -1516,11 +1613,17 @@ async function routeStaffAction(c) {
     if (s.status !== 'suspended') return err('Only suspended team members can be reinstated.');
     s.status = 'accepted';
     log(state, c.ctx, b.id, 'staff_reinstated', s.name);
-  } else if (a === 'remove') {
-    s.status = 'removed'; s.invite = '';
+  } else if (a === 'cancel' || a === 'remove') {
+    // Cancel works at any time (left the company, lost phone, invite never used). Their phone stops working at once;
+    // their past redemptions stay on record so totals and the audit trail still add up.
+    if (s.status === 'cancelled') return err('This team member is already cancelled.');
+    s.status = 'cancelled'; s.invite = ''; s.cancelledAt = now; s.tokenVer = (s.tokenVer || 0) + 1;
     log(state, c.ctx, b.id, 'staff_removed', s.name);
-  } else if (a === 'reinvite') {
-    if (s.status !== 'invited') return err('This person already accepted.');
+  } else if (a === 'reinvite' || a === 'new_device') {
+    if (a === 'reinvite' && s.status !== 'invited' && s.status !== 'cancelled') return err('This person already accepted. Use "Lost phone / new phone" instead.');
+    if (a === 'new_device' && s.status !== 'accepted' && s.status !== 'suspended') return err('Only people who already joined can move to a new phone.');
+    if (s.status === 'cancelled' && !(limitsFor(b, now).staff > state.staff.filter((x) => x.bizId === b.id && staffCounts(x)).length)) return err('Your plan\'s team limit is full.');
+    if (a === 'new_device' || s.status === 'cancelled') { s.tokenVer = (s.tokenVer || 0) + 1; s.status = 'invited'; s.cancelledAt = 0; log(state, c.ctx, b.id, 'staff_invited', `${s.name} (${a === 'new_device' ? 'new phone' : 'invited again'})`); }
     s.invite = rand(20); s.inviteExpiresAt = now + 7 * DAY;
     const base = siteBase(c);
     const path = 'staff.html?invite=' + s.invite;
@@ -1548,7 +1651,7 @@ async function routeStaffAccept(c) {
   if (n.length >= 2) s.name = n;
   s.status = 'accepted'; s.acceptedAt = now; s.invite = '';
   log(state, c.ctx, b.id, 'staff_accepted', s.name);
-  const token = await signToken(c.ctx.secret, { role: 'staff', id: s.id, exp: now + 14 * DAY });
+  const token = await signToken(c.ctx.secret, { role: 'staff', id: s.id, v: s.tokenVer || 0, exp: now + 14 * DAY });
   return ok({ token, staff: { id: s.id, name: s.name }, business: { name: b.name, emoji: b.emoji } });
 }
 
@@ -1869,6 +1972,7 @@ const ROUTES = [
   ['GET', '/api/deals', routeDeals],
   ['POST', '/api/view', routeView],
   ['POST', '/api/claim', routeClaim],
+  ['POST', '/api/unsave', routeUnsave],
   ['GET', '/api/passes', routePasses],
   ['GET', '/api/wallet/:platform/:id', routeWallet],
   ['POST', '/api/subscribe', routeSubscribe],
@@ -1891,6 +1995,9 @@ const ROUTES = [
   ['POST', '/api/business/deals/:id/status', routeDealStatus],
   ['POST', '/api/business/deals/:id/delete', routeDealDelete],
   ['POST', '/api/business/redeem', routeRedeem],
+  ['GET', '/api/business/report', routeReport],
+  ['GET', '/api/business/redemptions', routeRedemptionLog],
+  ['POST', '/api/share', routeShare],
   ['POST', '/api/business/forgot', routeBizForgot],
   ['POST', '/api/business/reset', routeBizReset],
   ['GET', '/api/business/staff', routeStaffList],
@@ -1923,6 +2030,7 @@ const ROUTES = [
   ['POST', '/api/admin/seed', routeAdminSeed],
   ['POST', '/api/admin/reset', routeAdminReset],
 ];
+
 
 // ===== seed.js =====
 /*
@@ -2052,6 +2160,8 @@ async function buildSeed(now) {
   const kai = mkStaff({ name: 'Kai', method: 'sms', contact: '555 010 2233', locationId: downtown });
   mkStaff({ name: 'Riley', method: 'email', contact: 'riley@example.com', status: 'invited', createdAt: now - 1 * DAY, acceptedAt: 0, invite: 'demoinviteriley0000001', inviteExpiresAt: now + 6 * DAY });
   mkStaff({ name: 'Sasha', method: 'email', contact: 'sasha@example.com', status: 'suspended', createdAt: now - 60 * DAY, acceptedAt: now - 59 * DAY });
+  mkStaff({ name: 'Mo (left the company)', method: 'qr', status: 'cancelled', createdAt: now - 70 * DAY, acceptedAt: now - 69 * DAY, cancelledAt: now - 20 * DAY });
+  for (const p of s.passes) if (p.friendSaves > 0) p.sharedAt = p.createdAt + HOUR;
   ev(brew.id, 'staff_invited', 'Jo (morning shift) (QR)', now - 40 * DAY);
   ev(brew.id, 'staff_accepted', 'Jo (morning shift)', now - 39 * DAY);
   ev(brew.id, 'staff_invited', 'Riley (EMAIL)', now - 1 * DAY);
@@ -2084,7 +2194,8 @@ async function buildSeed(now) {
   return s;
 }
 
-// ===== worker/index.js =====
+
+// ===== index.js (worker) =====
 /*
  * LocalHints Cloudflare Worker.
  * A thin wrapper: it receives HTTP requests, hands them to the shared engine
@@ -2103,6 +2214,7 @@ async function buildSeed(now) {
  *   ADMIN_EMAIL                      where the admin "Forgot password" link is sent
  *   ANTHROPIC_API_KEY, AI_MODEL      optional: lets "What to try next" use Claude (AI_MODEL defaults to claude-haiku-5-5)
  */
+
 
 const STATE_KEY = 'state';
 

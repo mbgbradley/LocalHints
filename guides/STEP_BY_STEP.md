@@ -152,3 +152,9 @@ then paste it into Cloudflare again.
 | Change how it looks | "Make the deal cards bigger and the buttons orange. Tell me which file to edit." |
 | Add a feature | "Add (feature). Tell me which files to change." |
 | Understand code | "Explain `docs/js/engine.js` like I'm 15." |
+
+
+## Managing your team (V6)
+
+- **Someone quits or loses their phone?** Business page, Your Team tab. Press **Cancel access** (they are locked out right away), or **Lost phone** to make a fresh link for the same person.
+- **Who is redeeming too many?** The same tab shows each person's share of all redemptions and a flag if something looks odd. The Redemption log lists every redemption with the name of who entered it.

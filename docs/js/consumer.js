@@ -10,7 +10,7 @@ import { initNav, navigate } from './nav.js';
 const CID = consumerId();
 const S = {
   tab: 'discover', deals: [], tips: [], passes: [], alerts: [], notify: false, health: null,
-  cat: '', q: '', radius: '0', pos: loadPos(), loading: true, map: null, seen: +(safe('lh:alerts-seen') || 0),
+  cat: '', sort: '', radius: '0', pos: loadPos(), loading: true, map: null, seen: +(safe('lh:alerts-seen') || 0),
 };
 function safe(k, v) {
   try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { /* storage blocked */ }
@@ -41,7 +41,7 @@ const unseen = () => S.alerts.filter((a) => a.at > S.seen).length;
 
 // ---------------------------------------------------------------- shell
 
-const NAV = [['discover', 'home', 'Discover'], ['map', 'map', 'Map'], ['loop', 'loop', 'Loop'], ['wallet', 'wallet', 'Wallet'], ['alerts', 'bell', 'Alerts']];
+const NAV = [['discover', 'home', 'Discover'], ['map', 'map', 'Map'], ['loop', 'loop', 'Loop'], ['wallet', 'heart', 'Favorites'], ['alerts', 'bell', 'Alerts']];
 function shell() {
   root.className = 'app-shell';
   root.innerHTML = `
@@ -87,17 +87,42 @@ function render() {
 
 // ---------------------------------------------------------------- discover
 
+const SORTS = [
+  ['', 'Default order', 'Sort Deals'],
+  ['pct-asc', '% Off ▲ (less % to more %)', '% Off ▲'], ['pct-desc', '% Off ▼ (more % to less %)', '% Off ▼'],
+  ['amt-asc', '$ Off ▲ (less $ to more $)', '$ Off ▲'], ['amt-desc', '$ Off ▼ (more $ to less $)', '$ Off ▼'],
+  ['end-asc', 'Ending ▲ (fewest days to most, then not ending)', 'Ending ▲'], ['end-desc', 'Ending ▼ (most days to fewest, not ending first)', 'Ending ▼'],
+];
+const DISTANCES = [['0', 'Any distance', 'Deal Distance'], ['0.5', '0.5 mile', '0.5 mi'], ['1', '1 mile', '1 mi'], ['3', '3 miles', '3 mi'], ['10', '10 miles', '10 mi'], ['25', '25 miles', '25 mi'], ['50', '50 miles', '50 mi']];
+const NO_END = 365 * 86400000; // an end date more than a year away counts as "not ending"
+
+function sortDeals(list) {
+  const k = S.sort;
+  if (!k) return list;
+  const dir = k.endsWith('desc') ? -1 : 1;
+  let key;
+  if (k.startsWith('pct')) key = (d) => (d.type === 'percent' ? d.value : null);
+  else if (k.startsWith('amt')) key = (d) => (d.type === 'amount' ? d.value : null);
+  else key = (d) => (!d.endsAt || d.endsAt - Date.now() > NO_END ? Infinity : d.endsAt);
+  const ending = k.startsWith('end');
+  return list.map((d, i) => [d, i]).sort((a, z) => {
+    const x = key(a[0]), y = key(z[0]);
+    if (!ending && (x == null || y == null)) return x == null && y == null ? a[1] - z[1] : x == null ? 1 : -1; // other deal types always last
+    if (x === y) return a[1] - z[1];
+    return (x < y ? -1 : 1) * dir;
+  }).map((x) => x[0]);
+}
 function filtered() {
-  const q = S.q.trim().toLowerCase();
-  return S.deals.filter((d) => {
+  return sortDeals(S.deals.filter((d) => {
     if (S.cat && d.biz.category !== S.cat) return false;
-    if (q && !(d.title + ' ' + d.biz.name + ' ' + d.description).toLowerCase().includes(q)) return false;
     if (S.pos && +S.radius > 0 && d.distance > +S.radius) return false;
     return true;
-  });
+  }));
 }
-function dealCard(d) {
-  return `<button class="deal" data-deal="${esc(d.id)}">
+const savedIds = () => new Set(S.passes.filter((p) => p.deal).map((p) => p.deal.id));
+function dealCard(d, saved) {
+  const on = saved.has(d.id);
+  return `<div class="deal" role="button" tabindex="0" data-deal="${esc(d.id)}">
     ${avatar(d.biz)}
     <div class="grow">
       <span class="tag" style="background:${esc(d.color)}">${esc(d.label)}</span>
@@ -106,37 +131,97 @@ function dealCard(d) {
       ${d.loop ? `<span class="loop-tag">🔁 Then ${esc(d.loop.rewardText)} at ${esc(d.loop.partner.name)}</span>` : ''}
       ${d.stamps > 1 ? `<span class="loop-tag">🎟️ ${d.stamps}-stamp card</span>` : ''}
       ${d.soldOut ? '<span class="badge b-bad">All spots taken</span>' : ''}
-    </div></button>`;
-}
-function filterBar() {
-  return `<div class="stack">
-    <input class="input" id="q" type="search" placeholder="Search deals and shops" value="${esc(S.q)}" aria-label="Search">
-    <div class="chips" role="group" aria-label="Category">
-      <button class="chip" aria-pressed="${!S.cat}" data-cat="">All</button>
-      ${CATEGORIES.map((c) => `<button class="chip" aria-pressed="${S.cat === c.id}" data-cat="${c.id}">${c.emoji} ${esc(c.label)}</button>`).join('')}
     </div>
-    ${S.pos ? `<label class="row small muted">Show deals within
-      <select class="input" id="radius" style="width:auto;min-height:36px;padding:4px 10px">
-        ${[['0', 'any distance'], ['1', '1 mile'], ['3', '3 miles'], ['10', '10 miles'], ['25', '25 miles']].map(([v, l]) => `<option value="${v}" ${S.radius === v ? 'selected' : ''}>${l}</option>`).join('')}
-      </select></label>` : ''}
-  </div>`;
+    <button class="heart ${on ? 'on' : ''}" data-heart="${esc(d.id)}" aria-pressed="${on}" aria-label="${on ? 'Saved to your Favorites. Tap to remove it' : 'Save to your Favorites'}">${icon('heart', 24, on)}</button></div>`;
 }
+/** Three equal buttons: Deal Distance, Deal Type, Sort Deals. `sort:false` leaves out Sort (the map has no order). */
+function filterBar({ sort = true } = {}) {
+  const typeShort = (S.cat && CATEGORIES.find((c) => c.id === S.cat)) || null;
+  const btn = (id, label, on) => `<button class="fbtn" data-menu="${id}" data-on="${on ? 1 : 0}" aria-haspopup="menu" aria-expanded="false"><span>${esc(label)}</span><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 4l4 4 4-4"/></svg></button>`;
+  const dist = DISTANCES.find((x) => x[0] === S.radius) || DISTANCES[0];
+  const srt = SORTS.find((x) => x[0] === S.sort) || SORTS[0];
+  return `<div class="fbar ${sort ? '' : 'two'}" id="fbar">${btn('dist', dist[2], +S.radius > 0)}${btn('type', typeShort ? typeShort.label : 'Deal Type', !!S.cat)}${sort ? btn('sort', srt[2], !!S.sort) : ''}</div>`;
+}
+function menuOptions(kind) {
+  if (kind === 'dist') return DISTANCES.map(([v, l]) => [v, l, S.radius === v]);
+  if (kind === 'type') return [['', 'All', !S.cat], ...CATEGORIES.map((c) => [c.id, `${c.emoji} ${c.label}`, S.cat === c.id])];
+  return SORTS.map(([v, l]) => [v, l, S.sort === v]);
+}
+function closeMenu() { document.querySelectorAll('.fmenu').forEach((m) => m.remove()); document.querySelectorAll('.fbtn[aria-expanded="true"]').forEach((b) => b.setAttribute('aria-expanded', 'false')); }
 function bindFilters(v) {
-  const q = v.querySelector('#q');
-  if (q) q.oninput = () => { S.q = q.value; refreshList(); };
-  v.querySelectorAll('[data-cat]').forEach((b) => (b.onclick = () => { S.cat = b.dataset.cat; v.querySelectorAll('[data-cat]').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); refreshList(); }));
-  const r = v.querySelector('#radius');
-  if (r) r.onchange = () => { S.radius = r.value; refreshList(); };
+  const bar = v.querySelector('#fbar');
+  if (!bar) return;
+  bar.querySelectorAll('[data-menu]').forEach((b) => (b.onclick = (e) => {
+    e.stopPropagation();
+    const kind = b.dataset.menu;
+    const wasOpen = b.getAttribute('aria-expanded') === 'true';
+    closeMenu();
+    if (wasOpen) return;
+    b.setAttribute('aria-expanded', 'true');
+    const m = document.createElement('div');
+    m.className = 'fmenu';
+    m.setAttribute('role', 'menu');
+    m.innerHTML = menuOptions(kind).map(([val, label, on]) => `<button role="menuitemradio" aria-checked="${on}" data-val="${esc(val)}"><span>${esc(label)}</span>${on ? '✓' : ''}</button>`).join('');
+    const bb = b.getBoundingClientRect(), pr = bar.getBoundingClientRect();
+    m.style.left = Math.max(0, Math.min(bb.left - pr.left, pr.width - 210)) + 'px';
+    bar.appendChild(m);
+    m.onclick = (ev) => {
+      const o = ev.target.closest('[data-val]');
+      if (!o) return;
+      const val = o.dataset.val;
+      if (kind === 'dist') {
+        if (+val > 0 && !S.pos) { closeMenu(); toast('Set your location first so we can measure distance.'); return locationSheet(); }
+        S.radius = val;
+      } else if (kind === 'type') S.cat = val; else S.sort = val;
+      closeMenu();
+      const view = document.getElementById('view');
+      const fb = view.querySelector('#fbar');
+      fb.outerHTML = filterBar({ sort: !fb.classList.contains('two') });
+      bindFilters(view);
+      if (S.tab === 'map') drawPins(); else refreshList();
+    };
+  }));
 }
+document.addEventListener('click', (e) => { if (!e.target.closest('.fmenu')) closeMenu(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
+
 function listHtml() {
   const list = filtered();
-  if (!list.length) return `<div class="empty"><div class="big">🔎</div><p>No deals match right now.</p>${S.cat || S.q || +S.radius ? '<button class="btn mt" id="clear">Clear filters</button>' : ''}</div>`;
-  return list.map(dealCard).join('');
+  if (!list.length) return `<div class="empty"><div class="big">🔎</div><p>No deals match right now.</p>${S.cat || +S.radius ? '<button class="btn mt" id="clear">Clear filters</button>' : ''}</div>`;
+  const saved = savedIds();
+  return list.map((d) => dealCard(d, saved)).join('');
 }
 function bindList(v) {
-  v.querySelectorAll('[data-deal]').forEach((b) => (b.onclick = () => showDeal(b.dataset.deal)));
+  v.querySelectorAll('[data-deal]').forEach((b) => {
+    b.onclick = () => openDeal(b.dataset.deal);
+    b.onkeydown = (e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === b) { e.preventDefault(); openDeal(b.dataset.deal); } };
+  });
+  v.querySelectorAll('[data-heart]').forEach((h) => (h.onclick = (e) => { e.stopPropagation(); heart(h); }));
   const c = v.querySelector('#clear');
-  if (c) c.onclick = () => { S.cat = ''; S.q = ''; S.radius = '0'; renderDiscover(document.getElementById('view')); };
+  if (c) c.onclick = () => { S.cat = ''; S.radius = '0'; S.sort = ''; renderDiscover(document.getElementById('view')); };
+}
+const passFor = (id) => S.passes.find((p) => p.kind !== 'loop' && p.deal && p.deal.id === id);
+/** Tapping a deal box: a saved deal opens its pass, anything else opens the deal details. */
+function openDeal(id) { const mine = passFor(id); return mine ? showPass(mine.id) : showDeal(id); }
+/** Heart is a toggle: empty heart saves the pass to My Deals (red heart), red heart removes it again. Returns true if now saved. */
+async function toggleHeart(id) {
+  const mine = passFor(id);
+  if (mine) {
+    await api.post('/api/unsave', { dealId: id, consumerId: CID });
+    await loadPasses();
+    toast('Removed from your Favorites');
+    return false;
+  }
+  const ref = safe('lh:ref:' + id) || '';
+  await api.post('/api/claim', { dealId: id, consumerId: CID, ref });
+  await loadPasses();
+  toast('Saved to your Favorites ❤️');
+  return true;
+}
+function heart(h) {
+  guard(h, async () => {
+    try { await toggleHeart(h.dataset.heart); refreshList(); } catch (e) { toast(e.message, 'bad'); }
+  });
 }
 function refreshList() {
   const el = document.getElementById('list');
@@ -146,7 +231,7 @@ function refreshList() {
   if (S.map) drawPins();
 }
 function renderDiscover(v) {
-  v.innerHTML = `<div class="hero"><h1>Deals near you</h1><p class="muted">Save a deal to your phone wallet and show it at the counter.</p></div>
+  v.innerHTML = `<div class="hero"><h1>Deals near you</h1><p class="muted">Tap the ❤️ to save a deal to your Favorites, then show it at the counter.</p></div>
     <div class="discover with-map mt">
       <div class="stack">${filterBar()}<div id="list" class="stack">${listHtml()}</div>
         ${S.tips.length ? `<h3 class="section-title">Spotted by neighbors</h3>${S.tips.map((t) => `<div class="card flat small"><b>${esc(t.name)}</b>${t.address ? ' · ' + esc(t.address) : ''}<div class="muted">${esc(t.note)}</div><div class="tiny muted mt">Spotted by <b>${esc(t.spotter)}</b> · ${esc(ago(t.spottedAt))}</div></div>`).join('')}` : ''}
@@ -166,7 +251,7 @@ function destroyMap() {
   if (S.map) { S.map.remove(); S.map = null; S.layer = null; }
 }
 function renderMap(v) {
-  v.innerHTML = `<div class="row between"><h1>Deal map</h1><span class="small muted">Tap a pin for details</span></div><div class="mt">${filterBar()}</div><div id="map" class="mt"></div>`;
+  v.innerHTML = `<div class="row between"><h1>Deal map</h1><span class="small muted">Tap a pin for details</span></div><div class="mt">${filterBar({ sort: false })}</div><div id="map" class="mt"></div>`;
   bindFilters(v);
   initMap();
 }
@@ -187,6 +272,7 @@ async function initMap() {
   S.layer = L.layerGroup().addTo(S.map);
   drawPins(true);
 }
+const popHeart = (id) => { const on = !!passFor(id); return `<button class="popheart ${on ? 'on' : ''}" data-popheart="${esc(id)}" aria-pressed="${on}" aria-label="${on ? 'Saved to your Favorites. Tap to remove it' : 'Save to your Favorites'}">${icon('heart', 18, on)}</button>`; };
 function drawPins(fit) {
   const L = window.L;
   if (!S.map || !L) return;
@@ -196,12 +282,13 @@ function drawPins(fit) {
   for (const d of filtered()) (byBiz.get(d.biz.id) || byBiz.set(d.biz.id, []).get(d.biz.id)).push(d);
   for (const [, ds] of byBiz) {
     const b = ds[0].biz;
+    const saved = ds.some((d) => passFor(d.id));
     const icon = L.divIcon({
       className: '', iconSize: [44, 44], iconAnchor: [22, 44],
-      html: `<div style="width:44px;height:44px;border-radius:50% 50% 50% 4px;transform:rotate(-45deg);background:${esc(ds[0].color)};box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;border:2px solid #fff"><span style="transform:rotate(45deg);font-size:20px">${esc(b.emoji)}</span></div>`,
+      html: `<div style="width:44px;height:44px;border-radius:50% 50% 50% 4px;transform:rotate(-45deg);background:${esc(ds[0].color)};box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;border:${saved ? '3px solid #e11d48' : '2px solid #fff'}"><span style="transform:rotate(45deg);font-size:20px">${esc(b.emoji)}</span></div>`,
     });
     const m = L.marker([b.lat, b.lng], { icon }).addTo(S.layer);
-    const popup = (where) => `<b>${esc(b.name)}</b>${where ? ' · ' + esc(where) : ''}<br>${ds.map((d) => `<a href="#" data-popdeal="${esc(d.id)}">${esc(d.label)}: ${esc(d.title)}</a>`).join('<br>')}`;
+    const popup = (where) => `<b>${esc(b.name)}</b>${where ? ' · ' + esc(where) : ''}<br>${ds.map((d) => `<div class="popdeal"><a href="#" data-popdeal="${esc(d.id)}">${esc(d.label)}: ${esc(d.title)}</a>${popHeart(d.id)}</div>`).join('')}`;
     m.bindPopup(popup(b.locations && b.locations.length ? 'Main location' : ''));
     pts.push([b.lat, b.lng]);
     for (const loc of b.locations || []) {
@@ -217,8 +304,27 @@ function drawPins(fit) {
 }
 document.addEventListener('click', (e) => {
   const a = e.target.closest('[data-popdeal]');
-  if (a) { e.preventDefault(); showDeal(a.dataset.popdeal); }
+  if (a) { e.preventDefault(); openDeal(a.dataset.popdeal); }
+  const h = e.target.closest('[data-popheart]');
+  if (h) {
+    e.preventDefault();
+    guard(h, async () => {
+      try {
+        const on = await toggleHeart(h.dataset.popheart);
+        h.classList.toggle('on', on); h.setAttribute('aria-pressed', on);
+        h.innerHTML = icon('heart', 18, on);
+        drawPins(); // the pin outline turns red (or back to white); the open popup is rebuilt below
+        reopenPopup(h.dataset.popheart);
+        if (document.getElementById('list')) refreshList();
+      } catch (er) { toast(er.message, 'bad'); }
+    });
+  }
 });
+function reopenPopup(dealId) {
+  const d = S.deals.find((x) => x.id === dealId);
+  if (!d || !S.map || !S.layer) return;
+  S.layer.eachLayer((m) => { if (m.getLatLng && Math.abs(m.getLatLng().lat - d.biz.lat) < 1e-9 && Math.abs(m.getLatLng().lng - d.biz.lng) < 1e-9 && m.openPopup) m.openPopup(); });
+}
 
 // ---------------------------------------------------------------- Main Street Loop
 
@@ -249,7 +355,7 @@ function dealBody(d) {
         <li>${esc(timeLeft(d.endsAt))} (until ${esc(fmtDate(d.endsAt))})</li>
         ${d.minSpend ? `<li>Minimum spend $${esc(d.minSpend)}</li>` : ''}
         ${d.stamps > 1 ? `<li>Punch card: collect ${d.stamps} stamps</li>` : ''}
-        ${d.upgrade ? `<li>Share with ${d.upgrade.friendsNeeded} friend${d.upgrade.friendsNeeded > 1 ? 's' : ''} to upgrade to ${d.type === 'percent' ? d.upgrade.upgradedValue + '%' : '$' + d.upgrade.upgradedValue} off</li>` : ''}
+        ${d.upgrade ? `<li>Share with ${d.upgrade.friendsNeeded} friend${d.upgrade.friendsNeeded > 1 ? 's' : ''} to upgrade to ${(d.upgrade.upgradedType || d.type) === 'percent' ? d.upgrade.upgradedValue + '%' : '$' + d.upgrade.upgradedValue} off</li>` : ''}
         ${d.spotsLeft != null ? `<li>${d.spotsLeft} spots left</li>` : ''}
       </ul>
     </div>
@@ -262,13 +368,13 @@ async function showDeal(id, note) {
   const mine = S.passes.find((p) => p.deal && p.deal.id === id);
   const el = openSheet(`${note ? `<div class="okmsg mb">${esc(note)}</div>` : ''}${dealBody(d)}
     <a class="btn btn-block mt" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${d.biz.lat},${d.biz.lng}">🧭 Directions</a>
-    <button class="btn btn-primary btn-block mt" id="claim" ${d.soldOut && !mine ? 'disabled' : ''}>${mine ? 'View my pass' : d.soldOut ? 'All spots taken' : '👛 Add to wallet'}</button>`);
+    <button class="btn btn-primary btn-block mt" id="claim" ${d.soldOut && !mine ? 'disabled' : ''}>${mine ? 'View my pass' : d.soldOut ? 'All spots taken' : '❤️ Save to Favorites'}</button>`);
   el.querySelector('#claim').onclick = (e) => guard(e.currentTarget, async () => {
     if (mine) return showPass(mine.id);
     const ref = safe('lh:ref:' + id) || '';
     const r = await api.post('/api/claim', { dealId: id, consumerId: CID, ref });
     await loadPasses();
-    toast(r.already ? 'You already have this pass.' : 'Saved to your wallet!');
+    toast(r.already ? 'You already have this pass.' : 'Saved to your Favorites!');
     showPass(r.pass.id);
   });
 }
@@ -314,6 +420,7 @@ async function showPass(id) {
   if (sh) sh.onclick = () => sharePass(p);
 }
 async function sharePass(p) {
+  api.post('/api/share', { passId: p.id, consumerId: CID }).catch(() => {});
   const url = `${location.origin}${location.pathname.replace(/[^/]*$/, '')}index.html?deal=${encodeURIComponent(p.deal.id)}&ref=${encodeURIComponent(p.referralCode)}`;
   const text = `Save this deal at ${p.biz.name}: ${p.deal.title}`;
   try {
@@ -343,9 +450,9 @@ function renderWallet(v) {
       <span class="tag" style="background:${esc(p.deal ? p.deal.color : '#0d9488')}">${esc(p.label)}</span>
       <h3>${esc(p.deal ? p.deal.title : 'Loop reward')}</h3>
       <div class="muted small">${esc(p.biz.name)} · <span class="badge ${STATUS[p.status][1]}">${STATUS[p.status][0]}</span>${p.stampsNeeded > 1 ? ` · ${p.stamps}/${p.stampsNeeded} stamps` : ''}</div></div></button>`;
-  v.innerHTML = `<h1>My wallet</h1>
+  v.innerHTML = `<h1>My Deals</h1><p class="muted mt small">Deals you hearted or saved with LocalHints. Tap the heart on a deal again to remove it. Open one and use the <b>Apple Wallet</b> or <b>Google Wallet</b> button to also keep it on your phone.</p>
     <div class="stack mt-lg">
-      ${S.passes.length ? '' : '<div class="empty"><div class="big">👛</div><p>Passes you save will show up here.</p><button class="btn btn-primary mt" id="find">Find deals</button></div>'}
+      ${S.passes.length ? '' : '<div class="empty"><div class="big">👛</div><p>Tap the ❤️ on a deal and it shows up here.</p><button class="btn btn-primary mt" id="find">Find deals</button></div>'}
       ${active.length ? `<h3 class="section-title">Ready to use</h3>${active.map(row).join('')}` : ''}
       ${done.length ? `<h3 class="section-title">History</h3>${done.map(row).join('')}` : ''}
     </div>`;

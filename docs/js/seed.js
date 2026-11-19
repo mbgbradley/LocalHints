@@ -126,6 +126,8 @@ export async function buildSeed(now) {
   const kai = mkStaff({ name: 'Kai', method: 'sms', contact: '555 010 2233', locationId: downtown });
   mkStaff({ name: 'Riley', method: 'email', contact: 'riley@example.com', status: 'invited', createdAt: now - 1 * DAY, acceptedAt: 0, invite: 'demoinviteriley0000001', inviteExpiresAt: now + 6 * DAY });
   mkStaff({ name: 'Sasha', method: 'email', contact: 'sasha@example.com', status: 'suspended', createdAt: now - 60 * DAY, acceptedAt: now - 59 * DAY });
+  mkStaff({ name: 'Mo (left the company)', method: 'qr', status: 'cancelled', createdAt: now - 70 * DAY, acceptedAt: now - 69 * DAY, cancelledAt: now - 20 * DAY });
+  for (const p of s.passes) if (p.friendSaves > 0) p.sharedAt = p.createdAt + HOUR;
   ev(brew.id, 'staff_invited', 'Jo (morning shift) (QR)', now - 40 * DAY);
   ev(brew.id, 'staff_accepted', 'Jo (morning shift)', now - 39 * DAY);
   ev(brew.id, 'staff_invited', 'Riley (EMAIL)', now - 1 * DAY);

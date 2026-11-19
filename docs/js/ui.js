@@ -302,3 +302,33 @@ export function bindChrome(scope, pageName) {
 }
 
 export { icon };
+
+// ---------------------------------------------------------------- emoji picker (a small set, plus "type or paste any emoji")
+
+const EMOJI_SETS = [
+  ['Food & drink', '🍕🍔🌮🌯🥪🍜🍝🍣🍱🥗🍗🥩🍟🌭🥞🧇🍳🥐🥖🧀🍰🧁🍩🍪🍫🍦🍨🍧🍿☕🍵🧋🥤🍺🍷🍸🍹🥂'],
+  ['Shops & services', '🛍️👗👠👜🧢👓💍🎁📚🛒💐🌸🪴🐶🐱🐾🧸🎨🖼️🔧🛠️🔨🧰🚗🛞⛽🧼🧺👔✂️💈💅💆💇'],
+  ['Health & fitness', '💪🏋️🧘🏃🚴⚽🏀🎾🏊🥊🩺💊🦷👁️🧠❤️🌿🥦🍎'],
+  ['Fun & places', '🎬🎭🎤🎧🎮🎳🎯🎪🎡🎢🏖️⛺🏨🛏️🏠🏪🏛️⛪🎓💻📱📷🎵🎶'],
+  ['Symbols', '⭐🌟✨🔥💎🏆🎉🎈💡🔔📍🏷️💯✅💚💙💜🧡💛'],
+];
+export const emojiFieldHtml = (value = '', label = 'Icon') => `<div class="field"><span class="lbl">${esc(label)} (one emoji, shown on the map)</span>
+  <div class="row"><input class="input" name="emoji" value="${esc(value)}" maxlength="16" style="width:90px;font-size:24px;text-align:center" aria-label="Icon emoji" autocomplete="off"><button type="button" class="btn btn-sm" data-emoji-pick>Choose an emoji</button></div>
+  <div class="hint">Any emoji works. You can also type or paste one: use the emoji key on your phone keyboard, <b>Win + .</b> on Windows, or <b>Ctrl + Cmd + Space</b> on a Mac.</div></div>`;
+export function bindEmoji(scope) {
+  const input = scope.querySelector('[name=emoji]');
+  const btn = scope.querySelector('[data-emoji-pick]');
+  if (!input || !btn) return;
+  btn.onclick = () => {
+    // shown inline (not as another sheet) so the form you are filling in stays open
+    let panel = scope.querySelector('.emojipanel');
+    if (panel) return panel.remove();
+    panel = document.createElement('div');
+    panel.className = 'card flat emojipanel mt';
+    panel.style.maxHeight = '240px';
+    panel.style.overflowY = 'auto';
+    panel.innerHTML = EMOJI_SETS.map(([t, set]) => `<div class="small muted mt">${esc(t)}</div><div class="emojigrid">${Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(set)).map((x) => `<button type="button" data-e="${esc(x.segment)}" aria-label="${esc(x.segment)}">${esc(x.segment)}</button>`).join('')}</div>`).join('');
+    btn.closest('.field').appendChild(panel);
+    panel.onclick = (e) => { const b = e.target.closest('[data-e]'); if (b) { input.value = b.dataset.e; panel.remove(); } };
+  };
+}
