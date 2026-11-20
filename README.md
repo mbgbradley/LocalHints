@@ -40,3 +40,9 @@ To go live, follow `guides/STEP_BY_STEP.md`.
 
 - The heart is a toggle (tap again to remove). The Wallet tab is now **Favorites** (heart icon) and its page is **My Deals**.
 - On the map, hearted deals get a red pin outline, and the pin popup has its own heart.
+
+## What is new in V8
+
+- One deal list: real deals and spotted deals together, with **Newest** (default) and **Oldest** sorts, and a ❤️ on spotted deals too.
+- **Add Deal** button (right of Sort Deals). The form asks for a Deal Type and a photo of the sign (camera opens on phones). Admin sees the photo, device ID and flags.
+- "Where are you?" now accepts a **ZIP code**.

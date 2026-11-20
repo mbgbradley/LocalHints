@@ -1,6 +1,6 @@
 /* LocalHints service worker: makes the site installable and lets the pages open offline.
    API calls are never cached. Bump CACHE when you change site files. */
-const CACHE = 'localhints-v5';
+const CACHE = 'localhints-v6';
 const FILES = ['./', 'index.html', 'business.html', 'admin.html', 'css/styles.css', 'js/config.js', 'js/api.js', 'js/engine.js', 'js/seed.js', 'js/ui.js', 'staff.html', 'js/nav.js', 'js/icons.js', 'js/charts.js', 'js/consumer.js', 'js/business.js', 'js/admin.js', 'js/staff.js', 'icon.svg', 'manifest.webmanifest'];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));

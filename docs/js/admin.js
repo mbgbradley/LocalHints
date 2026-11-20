@@ -338,12 +338,26 @@ async function vModeration(v) {
   const filt = S.tipFilter;
   const r = await call('GET', '/api/admin/tips', filt === 'pending' ? { status: 'pending' } : filt === 'live' ? { live: '1' } : {});
   const chip = (k, l) => `<button class="chip" aria-pressed="${filt === k}" data-tf="${k}">${l}</button>`;
-  v.innerHTML = `<h2>Spotted deals</h2><p class="muted mt">Deals that shoppers spotted. Approved ones show for 30 days under “Spotted by neighbors”, with the spotter’s first name.</p>
+  v.innerHTML = `<h2>Spotted deals</h2><p class="muted mt">Deals that shoppers spotted. Approved ones show for 30 days in the shoppers’ deal list as “Spotted deal”. Shoppers never see the photo, the contact or the device details. Check the photo against the details before you approve.</p>
     <div class="chips mt">${chip('', 'All')}${chip('pending', 'Suggested (waiting)')}${chip('live', 'Live now')}</div>
-    <div class="stack mt-lg">${r.tips.length ? r.tips.map((t) => `<div class="card stack"><div class="row between"><b>${esc(t.name)}</b><span class="badge ${t.live ? 'b-good' : t.status === 'rejected' ? 'b-bad' : t.status === 'approved' ? '' : 'b-warn'}">${t.live ? 'live' : t.status === 'approved' ? 'expired' : t.status}</span></div>${t.address ? `<div class="small muted">${esc(t.address)}</div>` : ''}<p>${esc(t.note)}</p>
-      <div class="small">Spotted by <b>${esc(t.spotterName || 'A neighbor')}</b>${t.contact ? ` · contact: <b>${esc(t.contact)}</b> ${t.consent ? '<span class="badge b-good">OK to share with the business</span>' : '<span class="badge b-warn">Do not share</span>'}` : ' · <span class="muted">no contact left</span>'}</div>
+    <div class="stack mt-lg">${r.tips.length ? r.tips.map((t) => {
+    const cat = CATEGORIES.find((c) => c.id === t.category);
+    const d = t.device || {};
+    return `<div class="card stack"><div class="row between"><b>${esc(t.name)}</b><span class="badge ${t.live ? 'b-good' : t.status === 'rejected' ? 'b-bad' : t.status === 'approved' ? '' : 'b-warn'}">${t.live ? 'live' : t.status === 'approved' ? 'expired' : t.status}</span></div>
+      <div class="small muted">${cat ? `${cat.emoji} ${esc(cat.label)}` : 'No deal type'}${t.address ? ' · ' + esc(t.address) : ' · no address'}${isFinite(t.lat) && t.lat !== null ? ' · address placed on map' : ''}</div>
+      <p>${esc(t.note)}</p>
+      ${t.photo ? `<button class="photobtn" data-photo="${esc(t.id)}" aria-label="Enlarge the photo of the sign"><img class="photoprev" src="${t.photo}" alt="Photo of the deal sign"></button>` : `<div class="small muted">No photo${t.photoDropped ? ' (older photos are removed to save space)' : ''}.</div>`}
+      <div class="small">${t.contact ? `Contact: <b>${esc(t.contact)}</b> ${t.consent ? '<span class="badge b-good">OK to share with the business</span>' : '<span class="badge b-warn">Do not share</span>'}` : '<span class="muted">No contact left</span>'}</div>
+      <div class="card flat small stack" style="gap:4px"><b>Device check</b>
+        ${(t.flags || []).map((f) => `<div><span class="badge b-bad">⚑ ${esc(f)}</span></div>`).join('')}
+        <div>Device ID: <code>${esc(d.id || 'unknown')}</code> · Fingerprint: <code>${esc(d.hash || 'unknown')}</code></div>
+        <div>Network address (IP): <code>${esc(d.ip || 'unknown')}</code></div>
+        <div>${esc(d.platform || '')} ${esc(d.screen || '')} · ${esc(d.tz || '')} · ${esc(d.lang || '')}</div>
+        <div class="muted" style="word-break:break-word">${esc(d.ua || '')}</div>
+        <div class="muted">Other tips from this device: ${t.related ? t.related.sameDevice : 0} · from this network: ${t.related ? t.related.sameNetwork : 0}. Websites cannot read a phone’s MAC address, so we use the device ID and fingerprint instead.</div></div>
       <div class="tiny muted">${esc(ago(t.at))}</div>
-    ${t.status === 'pending' ? `<div class="row"><button class="btn btn-primary btn-sm" data-tip="${esc(t.id)}" data-a="approve">Approve</button><button class="btn btn-sm" data-tip="${esc(t.id)}" data-a="reject">Reject</button></div>` : ''}</div>`).join('') : '<div class="empty"><p>Nothing here.</p></div>'}</div>`;
+    ${t.status === 'pending' ? `<div class="row"><button class="btn btn-primary btn-sm" data-tip="${esc(t.id)}" data-a="approve">Approve</button><button class="btn btn-sm" data-tip="${esc(t.id)}" data-a="reject">Reject</button></div>` : ''}</div>`; }).join('') : '<div class="empty"><p>Nothing here.</p></div>'}</div>`;
+  v.querySelectorAll('[data-photo]').forEach((b) => (b.onclick = () => { const t = r.tips.find((x) => x.id === b.dataset.photo); openSheet(`<h2>${esc(t.name)}</h2><img src="${t.photo}" alt="Photo of the deal sign" style="width:100%;border-radius:12px;margin-top:12px"><button class="btn btn-block mt-lg" data-close>Close</button>`); }));
   v.querySelectorAll('[data-tf]').forEach((b) => (b.onclick = () => { S.tipFilter = b.dataset.tf; refreshStatsTiles(); vModeration(v); }));
   v.querySelectorAll('[data-tip]').forEach((b) => (b.onclick = () => guard(b, async () => { await call('POST', `/api/admin/tips/${b.dataset.tip}`, { action: b.dataset.a }); await refreshStats(); vModeration(v); })));
 }

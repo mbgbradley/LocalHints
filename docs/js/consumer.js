@@ -10,7 +10,7 @@ import { initNav, navigate } from './nav.js';
 const CID = consumerId();
 const S = {
   tab: 'discover', deals: [], tips: [], passes: [], alerts: [], notify: false, health: null,
-  cat: '', sort: '', radius: '0', pos: loadPos(), loading: true, map: null, seen: +(safe('lh:alerts-seen') || 0),
+  cat: '', sort: 'newest', radius: '0', pos: loadPos(), loading: true, map: null, seen: +(safe('lh:alerts-seen') || 0),
 };
 function safe(k, v) {
   try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { /* storage blocked */ }
@@ -87,21 +87,23 @@ function render() {
 
 // ---------------------------------------------------------------- discover
 
+// [value, menu text, short text shown on the button]. Newest is the default, and it shows deals and spotted deals together.
 const SORTS = [
-  ['', 'Default order', 'Sort Deals'],
-  ['pct-asc', '% Off ▲ (less % to more %)', '% Off ▲'], ['pct-desc', '% Off ▼ (more % to less %)', '% Off ▼'],
-  ['amt-asc', '$ Off ▲ (less $ to more $)', '$ Off ▲'], ['amt-desc', '$ Off ▼ (more $ to less $)', '$ Off ▼'],
-  ['end-asc', 'Ending ▲ (fewest days to most, then not ending)', 'Ending ▲'], ['end-desc', 'Ending ▼ (most days to fewest, not ending first)', 'Ending ▼'],
+  ['newest', 'Newest', 'Sort Deals'], ['oldest', 'Oldest', 'Oldest'],
+  ['pct-asc', '% Off ▲', '% Off ▲'], ['pct-desc', '% Off ▼', '% Off ▼'],
+  ['amt-asc', '$ Off ▲', '$ Off ▲'], ['amt-desc', '$ Off ▼', '$ Off ▼'],
+  ['end-asc', 'Ending ▲', 'Ending ▲'], ['end-desc', 'Ending ▼', 'Ending ▼'],
 ];
+const DEFAULT_SORT = 'newest';
 const DISTANCES = [['0', 'Any distance', 'Deal Distance'], ['0.5', '0.5 mile', '0.5 mi'], ['1', '1 mile', '1 mi'], ['3', '3 miles', '3 mi'], ['10', '10 miles', '10 mi'], ['25', '25 miles', '25 mi'], ['50', '50 miles', '50 mi']];
 const NO_END = 365 * 86400000; // an end date more than a year away counts as "not ending"
 
 function sortDeals(list) {
-  const k = S.sort;
-  if (!k) return list;
-  const dir = k.endsWith('desc') ? -1 : 1;
+  const k = S.sort || DEFAULT_SORT;
+  const dir = k === 'newest' ? -1 : k.endsWith('desc') ? -1 : 1;
   let key;
-  if (k.startsWith('pct')) key = (d) => (d.type === 'percent' ? d.value : null);
+  if (k === 'newest' || k === 'oldest') key = (d) => d.startsAt || 0;
+  else if (k.startsWith('pct')) key = (d) => (d.type === 'percent' ? d.value : null);
   else if (k.startsWith('amt')) key = (d) => (d.type === 'amount' ? d.value : null);
   else key = (d) => (!d.endsAt || d.endsAt - Date.now() > NO_END ? Infinity : d.endsAt);
   const ending = k.startsWith('end');
@@ -112,14 +114,34 @@ function sortDeals(list) {
     return (x < y ? -1 : 1) * dir;
   }).map((x) => x[0]);
 }
-function filtered() {
-  return sortDeals(S.deals.filter((d) => {
+/** A spotted deal, shaped like a deal so one list can hold both. It has no % or $ value, so it sorts after real deals on those sorts. */
+const tipAsItem = (t) => ({ isTip: true, id: t.id, tip: t, type: null, value: null, startsAt: t.publishedAt, endsAt: t.endsAt, category: t.category, distance: t.distance });
+const catOf = (d) => (d.isTip ? d.category : d.biz.category);
+function filteredDeals() {
+  return S.deals.filter((d) => {
     if (S.cat && d.biz.category !== S.cat) return false;
     if (S.pos && +S.radius > 0 && d.distance > +S.radius) return false;
     return true;
-  }));
+  });
 }
+function filteredTips() {
+  // a spotted deal whose street address could not be placed on the map has no distance, so it stays in the list
+  return S.tips.map(tipAsItem).filter((d) => (!S.cat || d.category === S.cat) && !(S.pos && +S.radius > 0 && d.distance != null && d.distance > +S.radius));
+}
+const filtered = () => sortDeals([...filteredDeals(), ...filteredTips()]);
 const savedIds = () => new Set(S.passes.filter((p) => p.deal).map((p) => p.deal.id));
+function tipCard(d) {
+  const t = d.tip, on = !!t.favorite, cat = CATEGORIES.find((c) => c.id === t.category);
+  return `<div class="deal" role="button" tabindex="0" data-tip="${esc(t.id)}">
+    <div class="avatar tipav" aria-hidden="true">${cat ? cat.emoji : '🏷️'}</div>
+    <div class="grow">
+      <span class="tag tip-tag">Spotted deal</span>
+      <h3>${esc(t.name)}</h3>
+      <div class="small">${esc(t.note)}</div>
+      <div class="muted small">${t.address ? esc(t.address) + ' · ' : ''}${d.distance != null ? milesLabel(d.distance) + ' · ' : ''}${esc(timeLeft(t.endsAt))}</div>
+    </div>
+    <button class="heart ${on ? 'on' : ''}" data-tipheart="${esc(t.id)}" aria-pressed="${on}" aria-label="${on ? 'Saved to your Favorites. Tap to remove it' : 'Save to your Favorites'}">${icon('heart', 24, on)}</button></div>`;
+}
 function dealCard(d, saved) {
   const on = saved.has(d.id);
   return `<div class="deal" role="button" tabindex="0" data-deal="${esc(d.id)}">
@@ -134,23 +156,25 @@ function dealCard(d, saved) {
     </div>
     <button class="heart ${on ? 'on' : ''}" data-heart="${esc(d.id)}" aria-pressed="${on}" aria-label="${on ? 'Saved to your Favorites. Tap to remove it' : 'Save to your Favorites'}">${icon('heart', 24, on)}</button></div>`;
 }
-/** Three equal buttons: Deal Distance, Deal Type, Sort Deals. `sort:false` leaves out Sort (the map has no order). */
+/** Equal buttons in one row: Deal Distance, Deal Type, Sort Deals and Add Deal. `sort:false` (the map) leaves out Sort and Add Deal. */
 function filterBar({ sort = true } = {}) {
   const typeShort = (S.cat && CATEGORIES.find((c) => c.id === S.cat)) || null;
   const btn = (id, label, on) => `<button class="fbtn" data-menu="${id}" data-on="${on ? 1 : 0}" aria-haspopup="menu" aria-expanded="false"><span>${esc(label)}</span><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 4l4 4 4-4"/></svg></button>`;
   const dist = DISTANCES.find((x) => x[0] === S.radius) || DISTANCES[0];
-  const srt = SORTS.find((x) => x[0] === S.sort) || SORTS[0];
-  return `<div class="fbar ${sort ? '' : 'two'}" id="fbar">${btn('dist', dist[2], +S.radius > 0)}${btn('type', typeShort ? typeShort.label : 'Deal Type', !!S.cat)}${sort ? btn('sort', srt[2], !!S.sort) : ''}</div>`;
+  const srt = SORTS.find((x) => x[0] === (S.sort || DEFAULT_SORT)) || SORTS[0];
+  return `<div class="fbar ${sort ? 'four' : 'two'}" id="fbar">${btn('dist', dist[2], +S.radius > 0)}${btn('type', typeShort ? typeShort.label : 'Deal Type', !!S.cat)}${sort ? btn('sort', srt[2], S.sort !== DEFAULT_SORT) : ''}${sort ? '<button class="fbtn" id="tipBtn"><span>Add Deal</span></button>' : ''}</div>`;
 }
 function menuOptions(kind) {
   if (kind === 'dist') return DISTANCES.map(([v, l]) => [v, l, S.radius === v]);
   if (kind === 'type') return [['', 'All', !S.cat], ...CATEGORIES.map((c) => [c.id, `${c.emoji} ${c.label}`, S.cat === c.id])];
-  return SORTS.map(([v, l]) => [v, l, S.sort === v]);
+  return SORTS.map(([v, l]) => [v, l, (S.sort || DEFAULT_SORT) === v]);
 }
 function closeMenu() { document.querySelectorAll('.fmenu').forEach((m) => m.remove()); document.querySelectorAll('.fbtn[aria-expanded="true"]').forEach((b) => b.setAttribute('aria-expanded', 'false')); }
 function bindFilters(v) {
   const bar = v.querySelector('#fbar');
   if (!bar) return;
+  const add = bar.querySelector('#tipBtn');
+  if (add) add.onclick = () => tipSheet();
   bar.querySelectorAll('[data-menu]').forEach((b) => (b.onclick = (e) => {
     e.stopPropagation();
     const kind = b.dataset.menu;
@@ -189,16 +213,21 @@ function listHtml() {
   const list = filtered();
   if (!list.length) return `<div class="empty"><div class="big">🔎</div><p>No deals match right now.</p>${S.cat || +S.radius ? '<button class="btn mt" id="clear">Clear filters</button>' : ''}</div>`;
   const saved = savedIds();
-  return list.map((d) => dealCard(d, saved)).join('');
+  return list.map((d) => (d.isTip ? tipCard(d) : dealCard(d, saved))).join('');
 }
 function bindList(v) {
   v.querySelectorAll('[data-deal]').forEach((b) => {
     b.onclick = () => openDeal(b.dataset.deal);
     b.onkeydown = (e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === b) { e.preventDefault(); openDeal(b.dataset.deal); } };
   });
+  v.querySelectorAll('[data-tip]').forEach((b) => {
+    b.onclick = () => tipDetails(b.dataset.tip);
+    b.onkeydown = (e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === b) { e.preventDefault(); tipDetails(b.dataset.tip); } };
+  });
   v.querySelectorAll('[data-heart]').forEach((h) => (h.onclick = (e) => { e.stopPropagation(); heart(h); }));
+  v.querySelectorAll('[data-tipheart]').forEach((h) => (h.onclick = (e) => { e.stopPropagation(); tipHeart(h.dataset.tipheart, h, refreshList); }));
   const c = v.querySelector('#clear');
-  if (c) c.onclick = () => { S.cat = ''; S.radius = '0'; S.sort = ''; renderDiscover(document.getElementById('view')); };
+  if (c) c.onclick = () => { S.cat = ''; S.radius = '0'; S.sort = DEFAULT_SORT; renderDiscover(document.getElementById('view')); };
 }
 const passFor = (id) => S.passes.find((p) => p.kind !== 'loop' && p.deal && p.deal.id === id);
 /** Tapping a deal box: a saved deal opens its pass, anything else opens the deal details. */
@@ -223,6 +252,30 @@ function heart(h) {
     try { await toggleHeart(h.dataset.heart); refreshList(); } catch (e) { toast(e.message, 'bad'); }
   });
 }
+/** Heart on a spotted deal: toggles it in Favorites (no pass is made, because a spotted deal is not a LocalHints offer). */
+function tipHeart(id, btn, after) {
+  const t = S.tips.find((x) => x.id === id);
+  if (!t) return;
+  guard(btn, async () => {
+    try {
+      const r = await api.post('/api/tips/favorite', { tipId: id, consumerId: CID, on: !t.favorite });
+      t.favorite = r.favorite;
+      toast(r.favorite ? 'Saved to your Favorites ❤️' : 'Removed from your Favorites');
+      after();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+}
+function tipDetails(id) {
+  const t = S.tips.find((x) => x.id === id);
+  if (!t) return;
+  const cat = CATEGORIES.find((c) => c.id === t.category);
+  const el = openSheet(`<div class="row"><div class="avatar tipav" aria-hidden="true">${cat ? cat.emoji : '🏷️'}</div><div class="grow"><h2>${esc(t.name)}</h2><div class="muted small">${t.address ? esc(t.address) : 'No address given'}</div></div></div>
+    <div class="card flat mt-lg"><span class="tag tip-tag">Spotted deal</span>${cat ? ` <span class="small muted">${esc(cat.label)}</span>` : ''}<h3 class="mt">${esc(t.note)}</h3>
+      <p class="small muted mt">A neighbor spotted this deal and we checked it before posting. The shop has not confirmed it, so ask at the counter. ${esc(timeLeft(t.endsAt))}.</p></div>
+    ${t.address ? `<a class="btn btn-block mt" target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(t.name + ' ' + t.address)}">🧭 Directions</a>` : ''}
+    <button class="btn ${t.favorite ? '' : 'btn-primary'} btn-block mt" id="tf">${t.favorite ? 'Remove from Favorites' : '❤️ Save to Favorites'}</button>`);
+  el.querySelector('#tf').onclick = (e) => tipHeart(id, e.currentTarget, () => { closeSheet(); refreshList(); });
+}
 function refreshList() {
   const el = document.getElementById('list');
   if (!el) return;
@@ -234,14 +287,11 @@ function renderDiscover(v) {
   v.innerHTML = `<div class="hero"><h1>Deals near you</h1><p class="muted">Tap the ❤️ to save a deal to your Favorites, then show it at the counter.</p></div>
     <div class="discover with-map mt">
       <div class="stack">${filterBar()}<div id="list" class="stack">${listHtml()}</div>
-        ${S.tips.length ? `<h3 class="section-title">Spotted by neighbors</h3>${S.tips.map((t) => `<div class="card flat small"><b>${esc(t.name)}</b>${t.address ? ' · ' + esc(t.address) : ''}<div class="muted">${esc(t.note)}</div><div class="tiny muted mt">Spotted by <b>${esc(t.spotter)}</b> · ${esc(ago(t.spottedAt))}</div></div>`).join('')}` : ''}
-        <button class="btn btn-block" id="tipBtn">💡 Spot a deal we missed</button>
       </div>
       <div class="only-desktop"><div id="map"></div></div>
     </div>`;
   bindFilters(v);
   bindList(v);
-  v.querySelector('#tipBtn').onclick = tipSheet;
   if (window.matchMedia('(min-width: 900px)').matches) initMap();
 }
 
@@ -279,7 +329,7 @@ function drawPins(fit) {
   S.layer.clearLayers();
   const pts = [];
   const byBiz = new Map();
-  for (const d of filtered()) (byBiz.get(d.biz.id) || byBiz.set(d.biz.id, []).get(d.biz.id)).push(d);
+  for (const d of filteredDeals()) (byBiz.get(d.biz.id) || byBiz.set(d.biz.id, []).get(d.biz.id)).push(d);
   for (const [, ds] of byBiz) {
     const b = ds[0].biz;
     const saved = ds.some((d) => passFor(d.id));
@@ -450,12 +500,16 @@ function renderWallet(v) {
       <span class="tag" style="background:${esc(p.deal ? p.deal.color : '#0d9488')}">${esc(p.label)}</span>
       <h3>${esc(p.deal ? p.deal.title : 'Loop reward')}</h3>
       <div class="muted small">${esc(p.biz.name)} · <span class="badge ${STATUS[p.status][1]}">${STATUS[p.status][0]}</span>${p.stampsNeeded > 1 ? ` · ${p.stamps}/${p.stampsNeeded} stamps` : ''}</div></div></button>`;
+  const favTips = S.tips.filter((t) => t.favorite);
   v.innerHTML = `<h1>My Deals</h1><p class="muted mt small">Deals you hearted or saved with LocalHints. Tap the heart on a deal again to remove it. Open one and use the <b>Apple Wallet</b> or <b>Google Wallet</b> button to also keep it on your phone.</p>
     <div class="stack mt-lg">
-      ${S.passes.length ? '' : '<div class="empty"><div class="big">👛</div><p>Tap the ❤️ on a deal and it shows up here.</p><button class="btn btn-primary mt" id="find">Find deals</button></div>'}
+      ${S.passes.length || favTips.length ? '' : '<div class="empty"><div class="big">👛</div><p>Tap the ❤️ on a deal and it shows up here.</p><button class="btn btn-primary mt" id="find">Find deals</button></div>'}
       ${active.length ? `<h3 class="section-title">Ready to use</h3>${active.map(row).join('')}` : ''}
+      ${favTips.length ? `<h3 class="section-title">Spotted deals you hearted</h3>${favTips.map((t) => tipCard(tipAsItem(t))).join('')}` : ''}
       ${done.length ? `<h3 class="section-title">History</h3>${done.map(row).join('')}` : ''}
     </div>`;
+  v.querySelectorAll('[data-tip]').forEach((b) => (b.onclick = () => tipDetails(b.dataset.tip)));
+  v.querySelectorAll('[data-tipheart]').forEach((h) => (h.onclick = (e) => { e.stopPropagation(); tipHeart(h.dataset.tipheart, h, () => renderWallet(v)); }));
   v.querySelectorAll('[data-pass]').forEach((b) => (b.onclick = () => showPass(b.dataset.pass)));
   const f = v.querySelector('#find');
   if (f) f.onclick = () => go('discover');
@@ -492,38 +546,109 @@ function setPos(p) {
   S.pos = p;
   safe('lh:pos', JSON.stringify(p));
 }
+/** Looks up the centre of a US ZIP code (free public service, no key). Returns { lat, lng, label } or throws a friendly Error. */
+async function lookupZip(zip) {
+  let res;
+  try { res = await fetch('https://api.zippopotam.us/us/' + zip); } catch { throw new Error('We could not look up that ZIP code right now. Check your connection and try again.'); }
+  if (res.status === 404) throw new Error('We could not find that ZIP code. Check the 5 digits.');
+  if (!res.ok) throw new Error('We could not look up that ZIP code right now. Please try again.');
+  const j = await res.json();
+  const pl = j.places && j.places[0];
+  if (!pl || !isFinite(+pl.latitude) || !isFinite(+pl.longitude)) throw new Error('We could not find that ZIP code. Check the 5 digits.');
+  return { lat: +pl.latitude, lng: +pl.longitude, label: `ZIP ${zip}`, zip };
+}
 function locationSheet() {
   const el = openSheet(`<h2>Where are you?</h2><p class="muted mt">We use this to sort deals by distance and show the map around you. It stays on your device.</p>
     <button class="btn btn-primary btn-block mt-lg" id="gps">📍 Use my current location</button>
+    <form class="stack mt-lg" id="zipForm" novalidate>
+      <label class="field"><span class="lbl">Or type your ZIP code</span><input class="input" id="zip" name="zip" inputmode="numeric" pattern="[0-9]{5}" maxlength="5" autocomplete="postal-code" placeholder="5 digits" value="${S.pos && S.pos.zip ? esc(S.pos.zip) : ''}" aria-describedby="zipErr"></label>
+      <div id="zipErr" role="alert"></div>
+      <button class="btn btn-block" id="zipGo">Use my zip code</button>
+    </form>
     ${MODE === 'demo' ? '<button class="btn btn-block mt" id="demo">Use the demo neighborhood</button>' : ''}
     ${S.pos ? '<button class="btn btn-block mt" id="clearLoc">Clear my location</button>' : ''}`);
-  const done = async () => { closeSheet(true); S.loading = true; shell(); await loadDeals(); S.loading = false; shell(); };
+  const done = async () => {
+    closeSheet(true); S.loading = true; shell(); await loadDeals(); S.loading = false; shell();
+    if (S.map && S.pos) S.map.setView([S.pos.lat, S.pos.lng], 13); // the map moves to the same point
+    if (S.map) drawPins();
+  };
   el.querySelector('#gps').onclick = (e) => guard(e.currentTarget, async () => { setPos({ ...(await getBrowserLocation()), label: 'My location' }); await done(); });
+  const zi = el.querySelector('#zip');
+  zi.oninput = () => { zi.value = zi.value.replace(/\D/g, '').slice(0, 5); el.querySelector('#zipErr').innerHTML = ''; };
+  el.querySelector('#zipForm').onsubmit = (e) => {
+    e.preventDefault();
+    const zip = zi.value;
+    if (!/^\d{5}$/.test(zip)) { el.querySelector('#zipErr').innerHTML = '<div class="err">Enter a 5-digit ZIP code.</div>'; return zi.focus(); }
+    guard(el.querySelector('#zipGo'), async () => {
+      try { setPos(await lookupZip(zip)); } catch (ex) { el.querySelector('#zipErr').innerHTML = `<div class="err">${esc(ex.message)}</div>`; return; }
+      await done();
+    });
+  };
   const d = el.querySelector('#demo');
   if (d) d.onclick = async () => { setPos({ ...DEMO_CENTER, label: 'Demo area' }); await done(); };
   const c = el.querySelector('#clearLoc');
   if (c) c.onclick = async () => { S.pos = null; safe('lh:pos', ''); try { localStorage.removeItem('lh:pos'); } catch { /* ignore */ } await done(); };
 }
+/** Shrinks a camera photo so it uploads fast and stays small in storage. */
+function shrinkPhoto(file, max = 1000) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const k = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      let q = 0.72, out = c.toDataURL('image/jpeg', q);
+      while (out.length > 200000 && q > 0.3) { q -= 0.1; out = c.toDataURL('image/jpeg', q); }
+      resolve(out);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('That photo could not be read. Please try again.')); };
+    img.src = url;
+  });
+}
+/** Details that help the admin spot one person adding many deals. A website cannot read a MAC address, so this is a device ID plus a few browser traits. */
+function deviceInfo() {
+  let tz = ''; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* ignore */ }
+  return { ua: navigator.userAgent, screen: `${screen.width}x${screen.height}`, tz, lang: navigator.language, platform: navigator.platform || '', cores: navigator.hardwareConcurrency || '', touch: navigator.maxTouchPoints || 0 };
+}
 function tipSheet() {
-  const me = safe('lh:spotter') || '';
-  const el = openSheet(`<h2>Spot a deal</h2><p class="muted mt">Tell us about a local deal. We check it before showing it to neighbors, and neighbors see your first name next to it.</p>
+  let photo = '';
+  const el = openSheet(`<h2>Add Deal</h2><p class="muted mt">Thank you for sharing a deal you found with the community. Deals get posted to the community once they are verified.</p>
     <form class="stack mt-lg" id="f">
-      <label class="field"><span class="lbl">Your first name</span><input class="input" name="spotterName" required maxlength="40" autocomplete="given-name" value="${esc(me)}"></label>
       <label class="field"><span class="lbl">Business name</span><input class="input" name="name" required maxlength="60"></label>
-      <label class="field"><span class="lbl">Address (optional)</span><input class="input" name="address" maxlength="120"></label>
+      <label class="field"><span class="lbl">Address (optional)</span><input class="input" name="address" maxlength="120" autocomplete="street-address"></label>
+      <label class="field"><span class="lbl">Deal Type</span><select class="input" name="category" required><option value="">Choose a deal type…</option>${CATEGORIES.map((c) => `<option value="${c.id}">${c.emoji} ${esc(c.label)}</option>`).join('')}</select></label>
       <label class="field"><span class="lbl">What is the deal?</span><textarea class="input" name="note" required maxlength="200"></textarea></label>
+      <div class="field"><span class="lbl">Photo of the deal sign</span>
+        <input type="file" id="photoIn" accept="image/*" capture="environment" hidden>
+        <button type="button" class="btn btn-block" id="photoBtn">Add Photo</button>
+        <div id="photoBox"></div>
+        <p class="hint">Take a picture of the sign, whether it is in the window, on a sandwich board or on the counter. Only our team sees the photo. It is never shown on the deal.</p></div>
       <label class="field"><span class="lbl">Email or phone (optional)</span><input class="input" name="contact" maxlength="120" autocomplete="email"></label>
-      <label class="check"><input type="checkbox" name="consent" value="1"> It is OK to share my name and this contact with the business, so they can say thanks and claim their listing.</label>
-      <p class="hint">Never shown to other shoppers. Leave it blank to stay anonymous apart from your first name.</p>
+      <label class="check"><input type="checkbox" name="consent" value="1"> It is OK to share this contact with the business, so they can say thanks and claim their listing.</label>
+      <p class="hint">Never shown to other shoppers. Leave it blank to stay anonymous.</p>
       <div id="tipErr"></div>
-      <button class="btn btn-primary btn-block">Send tip</button></form>`);
+      <button class="btn btn-primary btn-block">Submit deal</button></form>`);
+  const pin = el.querySelector('#photoIn'), box = el.querySelector('#photoBox'), pbtn = el.querySelector('#photoBtn');
+  pbtn.onclick = () => pin.click();
+  pin.onchange = async () => {
+    const file = pin.files && pin.files[0];
+    if (!file) return;
+    try {
+      photo = await shrinkPhoto(file);
+      box.innerHTML = `<img class="photoprev" src="${photo}" alt="Your photo of the deal sign">`;
+      pbtn.textContent = 'Retake Photo';
+    } catch (ex) { box.innerHTML = `<div class="err" role="alert">${esc(ex.message)}</div>`; }
+  };
   el.querySelector('#f').onsubmit = (e) => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.target));
-    guard(e.target.querySelector('button'), async () => {
+    delete f.photo;
+    guard(e.target.querySelector('button.btn-primary'), async () => {
       try {
-        await api.post('/api/tips', { ...f, consent: !!f.consent, consumerId: CID });
-        safe('lh:spotter', f.spotterName);
+        await api.post('/api/tips', { ...f, consent: !!f.consent, photo, consumerId: CID, deviceId: CID, device: deviceInfo() });
         closeSheet(true);
         toast('Thanks! We will review it.');
       } catch (ex) { el.querySelector('#tipErr').innerHTML = `<div class="err" role="alert">${esc(ex.message)}</div>`; }

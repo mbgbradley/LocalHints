@@ -49,15 +49,27 @@ r=await call('POST','/api/admin/forgot',{}); const at=r.body.demoLink.split('res
 r=await call('POST','/api/admin/password-reset',{token:at,password:'adminpass1'}); t('admin reset',r.status===200);
 r=await call('POST','/api/admin/login',{username:'Admin',password:'Admin'}); t('old admin pw rejected',r.status===401);
 r=await call('POST','/api/admin/login',{username:'Admin',password:'adminpass1'}); const atok=r.body.token; t('new admin pw',!!atok&&r.body.usingDefaults===false);
-r=await call('GET','/api/admin/stats',null,atok); t('stats',r.body.awaiting===1&&r.body.spottedSuggested===2&&r.body.spottedLive===1&&r.body.liveDeals>0);
+r=await call('GET','/api/admin/stats',null,atok); t('stats',r.body.awaiting===1&&r.body.spottedSuggested===2&&r.body.spottedLive===3&&r.body.liveDeals>0);
 r=await call('GET','/api/admin/businesses',null,atok,{awaiting:'1'}); t('awaiting filter',r.body.businesses.length===1&&r.body.businesses[0].status==='pending');
 r=await call('GET','/api/admin/deals',null,atok,{live:'1'}); t('admin live deals',r.body.deals.length>0&&r.body.deals.every(d=>d.live));
-r=await call('GET','/api/admin/tips',null,atok,{status:'pending'}); t('admin tips',r.body.tips.length===2&&r.body.tips[0].spotterName);
+r=await call('GET','/api/admin/tips',null,atok,{status:'pending'}); t('admin tips',r.body.tips.length===2&&r.body.tips[0].device&&r.body.tips[0].device.hash&&Array.isArray(r.body.tips[0].flags)&&r.body.tips[0].category);
 r=await call('GET','/api/admin/businesses/'+(await call('GET','/api/admin/businesses',null,atok)).body.businesses[0].id,null,atok); t('admin detail team',!!r.body.team);
-r=await call('POST','/api/tips',{name:'Cafe Z',note:'Nice deal here',spotterName:'Lee',contact:'lee@x.com'}); t('tip needs consent',r.status===400);
-r=await call('POST','/api/tips',{name:'Cafe Z',note:'Nice deal here'}); t('tip needs spotter',r.status===400);
-r=await call('POST','/api/tips',{name:'Cafe Z',note:'Nice deal here',spotterName:'Lee',contact:'lee@x.com',consent:true}); t('tip ok',r.status===200);
-r=await call('GET','/api/deals'); t('public tips hide contact',r.body.tips.every(x=>x.spotter&&!x.contact)&&r.body.tips.length===1);
+r=await call('POST','/api/tips',{name:'Cafe Z',note:'Nice deal here',category:'cafe',contact:'lee@x.com'}); t('tip needs consent',r.status===400);
+r=await call('POST','/api/tips',{name:'Cafe Z',note:'Nice deal here'}); t('tip needs deal type',r.status===400);
+r=await call('POST','/api/tips',{name:'Cafe Z',note:'Nice deal here',category:'nope'}); t('tip bad deal type',r.status===400);
+r=await call('POST','/api/tips',{name:'Cafe Z',note:'Nice deal here',category:'cafe',photo:'data:text/html;base64,AAAA'}); t('tip rejects non-image',r.status===400);
+const px='data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ==';
+r=await call('POST','/api/tips',{name:'Cafe Z',note:'Nice deal here',category:'cafe',contact:'lee@x.com',consent:true,photo:px,consumerId:'dev-A',deviceId:'dev-A',device:{screen:'390x844',tz:'America/New_York',lang:'en-US',platform:'iPhone',ua:'TestUA'}}); t('tip ok',r.status===200);
+r=await call('GET','/api/deals'); t('public tips hide contact, photo and device',r.body.tips.every(x=>!x.contact&&!x.photo&&!x.device&&!x.spotter)&&r.body.tips.length===3);
+r=await call('GET','/api/admin/tips',null,atok,{}); const zt=r.body.tips.find(x=>x.name==='Cafe Z'); t('admin sees photo + device',zt.photo===px&&zt.device.id==='dev-A'&&zt.device.hash.length===16&&zt.device.ua==='TestUA'&&zt.device.ip);
+for(let i=0;i<2;i++) await call('POST','/api/tips',{name:'Cafe Z'+i,note:'Nice deal here',category:'cafe',consumerId:'dev-A',deviceId:'dev-A',device:{screen:'390x844',tz:'America/New_York',lang:'en-US',platform:'iPhone',ua:'TestUA'}});
+r=await call('GET','/api/admin/tips',null,atok,{}); t('repeat device flagged',r.body.tips.some(x=>x.flags.some(f=>/from this device/.test(f))));
+// spotted deal favorites
+r=await call('POST','/api/admin/tips/'+zt.id,{action:'approve'},atok); t('approve tip',r.status===200);
+r=await call('POST','/api/tips/favorite',{tipId:zt.id,consumerId:'fan'}); t('tip heart on',r.body.favorite===true);
+r=await call('GET','/api/deals',null,null,{consumerId:'fan'}); t('tip flagged favorite',r.body.tips.find(x=>x.id===zt.id).favorite===true&&r.body.tips.filter(x=>x.favorite).length===1);
+r=await call('GET','/api/deals',null,null,{consumerId:'other'}); t('favorite is per shopper',r.body.tips.every(x=>!x.favorite));
+r=await call('POST','/api/tips/favorite',{tipId:zt.id,consumerId:'fan'}); t('tip heart toggles off',r.body.favorite===false);
 
 // ---- v6
 r=await call('GET','/api/business/report',null,tok,{kind:'live'}); t('report live asc',r.body.rows.length>0&&r.body.rows.every((x,i,a)=>!i||a[i-1].startsAt<=x.startsAt));

@@ -134,7 +134,7 @@ close the account.
 - **Emoji icons:** any emoji is accepted. `firstEmoji()` keeps one whole grapheme (flags, family, skin-tone, ZWJ). The UI has
   `emojiFieldHtml/bindEmoji` in ui.js: a typed/pasted field plus a "Choose an emoji" panel. Used at signup and in the profile.
 - **`POST /api/share`** records that a pass was shared (`sharedAt`).
-- After engine/seed changes regenerate `worker/worker-single-file.js`; bump `CACHE` in `docs/sw.js` (now `localhints-v5`).
+- After engine/seed changes regenerate `worker/worker-single-file.js`; bump `CACHE` in `docs/sw.js` (now `localhints-v6`).
 - `node --check file.js` treats files as CommonJS and misses ES-module template errors. Copy to a `.mjs` first, or open the page.
 
 ## Settings (Worker, not committed)
@@ -180,3 +180,26 @@ close the account.
 - **Map:** a business pin gets a red outline when any of its deals is hearted (white otherwise). The Leaflet popup lists each
   deal with a heart (`.popheart`, ~30px, about the size of Leaflet's close X). Toggling redraws the pins and reopens the popup.
 - Tests: `tests/map_stub_e2e.py` checks the popup heart and pin outline with a stand-in for Leaflet (the real library needs internet).
+
+## V8 additions (spotted deals become first-class, zip location)
+
+- **One list:** the Discover list holds real deals and spotted deals together (`filtered()` = `filteredDeals()` + `filteredTips()`,
+  tips shaped by `tipAsItem`). There is no separate "Spotted by neighbors" section any more. The Map uses `filteredDeals()` only.
+- **Buttons:** Deal Distance, Deal Type, Sort Deals, **Add Deal** in one equal-width row (`.fbar.four`; the Map shows two).
+  Add Deal opens the tip form. Sorts: **Newest (default)**, Oldest, % Off ▲▼, $ Off ▲▼, Ending ▲▼. Menu text has no parentheses.
+  Newest/Oldest use `startsAt` for deals and `publishedAt` (approval time) for spotted deals. On the % / $ sorts spotted deals sort after
+  real deals (they have no % or $). Ending uses the 30-day spotted-deal life. Ties keep list order.
+- **Spotted deal hearts:** `POST /api/tips/favorite {tipId, consumerId, on?}` toggles `state.tipFavs` (`{tipId, consumerId, at}`).
+  `GET /api/deals?consumerId=` marks each tip `favorite`. No pass is created. My Deals lists them under "Spotted deals you hearted".
+- **Tip form fields:** business name, address, **category (required, same ids as business categories)**, note, optional contact + consent,
+  optional **photo** (`<input capture="environment">`, shrunk in the browser to about 160 KB, `data:image/...` only). No spotter name any more
+  (`spotterName` is ignored). Tips store `lat/lng` only if the Google address check is configured and finds the address; tips with no
+  position stay visible when a distance is chosen (their distance is unknown).
+- **Never public:** `tipPublic()` leaves out photo, contact and device details. Admin (`GET /api/admin/tips`) gets photo, device and `flags`.
+- **Device check:** a website cannot read a MAC address (browsers and phones block it). We save `device = {id, hash, ip, ua, screen, tz, lang, platform}`:
+  `id` is the browser's saved shopper id, `hash` is a 16-character fingerprint (`deviceHash`), `ip` comes from the Worker (`CF-Connecting-IP`),
+  `ua` from the `User-Agent` header (the Worker passes it). Admin flags: 3+ tips from one device or fingerprint, 5+ from one network,
+  or a device that already had a tip rejected. Only the newest 60 tips keep their photo (`MAX_TIP_PHOTOS_KEPT`) so stored data stays small.
+- **ZIP location:** "Where are you?" has a 5-digit numeric box and "Use my zip code". `lookupZip()` calls the free `api.zippopotam.us` from the
+  browser (US only, no key). The result becomes `S.pos` (`label: 'ZIP 10001'`), deals re-sort by distance from that point, and the Map recenters on it.
+- Tests: `tests/engine.test.mjs` (76 checks) and `tests/browser_e2e.py` cover all of the above; the ZIP service is mocked in the browser test.

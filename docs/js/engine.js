@@ -657,7 +657,14 @@ async function routeDeals(c) {
     out.push(row);
   }
   out.sort((a, b) => (here ? a.distance - b.distance : b.startsAt - a.startsAt));
-  const tips = state.tips.filter((t) => tipIsLive(t, now)).slice(-10).map(tipPublic);
+  const me = consumerOf(c);
+  const favs = new Set((state.tipFavs || []).filter((f) => f.consumerId === me).map((f) => f.tipId));
+  const tips = state.tips.filter((t) => tipIsLive(t, now)).sort((a, z) => (z.approvedAt || z.at) - (a.approvedAt || a.at)).slice(0, 100).map((t) => {
+    const row = tipPublic(t);
+    row.favorite = favs.has(t.id);
+    if (here && isNum(t.lat) && isNum(t.lng)) row.distance = haversineMiles(here, { lat: t.lat, lng: t.lng });
+    return row;
+  });
   return ok({ deals: out, tips });
 }
 
@@ -1920,26 +1927,71 @@ async function routeAdminDeals(c) {
 
 const tipIsLive = (t, now) => t.status === 'approved' && (t.approvedAt || t.at) + TIP_LIFE > now;
 function tipPublic(t) {
-  return { id: t.id, name: t.name, address: t.address, note: t.note, spotter: t.spotterName || 'A neighbor', spottedAt: t.at };
+  // never includes the photo, the contact, or any device details: those are for the admin only
+  return {
+    id: t.id, name: t.name, address: t.address, note: t.note, category: t.category || '', spottedAt: t.at,
+    publishedAt: t.approvedAt || t.at, endsAt: (t.approvedAt || t.at) + TIP_LIFE,
+    lat: isNum(t.lat) ? t.lat : null, lng: isNum(t.lng) ? t.lng : null,
+  };
+}
+const MAX_TIP_PHOTO = 220000; // characters of base64 (about 160 KB); the browser shrinks photos before sending
+const MAX_TIP_PHOTOS_KEPT = 60; // older photos are dropped so the stored data stays small
+/** A short fingerprint of the phone/browser. Not a MAC address (websites cannot read those); it helps spot one person on many accounts. */
+function deviceHash(d, ua) {
+  const raw = [ua, d.screen, d.tz, d.lang, d.platform, d.cores, d.touch].map((x) => String(x == null ? '' : x)).join('|');
+  let h1 = 0x811c9dc5, h2 = 5381;
+  for (let i = 0; i < raw.length; i++) { h1 = Math.imul(h1 ^ raw.charCodeAt(i), 16777619) >>> 0; h2 = (Math.imul(h2, 33) + raw.charCodeAt(i)) >>> 0; }
+  return (h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')).toUpperCase();
 }
 async function routeTip(c) {
   const { state, body, now } = c;
   const note = clean(body.note, 200);
   const name = clean(body.name, 60);
-  const spotterName = clean(body.spotterName, 40);
   const contact = clean(body.contact, 120);
+  const category = clean(body.category, 30);
   if (name.length < 2 || note.length < 5) return err('Add the business name and a short note.');
-  if (spotterName.length < 2) return err('Add your first name so neighbors know who spotted it.');
+  if (!CAT_IDS.includes(category)) return err('Choose a deal type.');
   if (contact) {
     if (!body.consent) return err('Please tick the box to let us share your contact with the business, or leave the contact blank.');
     if (!validEmail(contact) && contact.replace(/\D/g, '').length < 7) return err('Enter a valid email or phone, or leave it blank.');
   }
+  let photo = '';
+  if (body.photo) {
+    photo = String(body.photo);
+    if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(photo)) return err('That photo could not be read. Please take it again.');
+    if (photo.length > MAX_TIP_PHOTO) return err('That photo is too big. Please take it again.');
+  }
   if (hit(state, 'tip:' + ipOf(c), now, 10, HOUR)) return err('Too many tips. Please try again later.', 429);
+  const dev = body.device && typeof body.device === 'object' ? body.device : {};
+  const ua = clean((c.req.headers && (c.req.headers['user-agent'] || c.req.headers['User-Agent'])) || dev.ua, 200);
+  const address = clean(body.address, 120);
+  let lat = null, lng = null;
+  if (address.length >= 6) {
+    try { const g = await geocode(c.ctx, address); if (g && g.ok) { lat = g.lat; lng = g.lng; } } catch { /* no address check available: the tip simply has no map position */ }
+  }
   state.tips.push({
-    id: uid('t'), consumerId: clean(body.consumerId, 60), name, address: clean(body.address, 120), note, spotterName,
+    id: uid('t'), consumerId: clean(body.consumerId, 60), name, address, note, category, lat, lng, photo,
     contact, consent: !!contact && !!body.consent, status: 'pending', at: now, approvedAt: 0,
+    device: { id: clean(body.deviceId || body.consumerId, 60), hash: deviceHash(dev, ua), ip: ipOf(c), ua, screen: clean(dev.screen, 20), tz: clean(dev.tz, 60), lang: clean(dev.lang, 20), platform: clean(dev.platform, 40) },
   });
+  // keep stored data small: only the newest few tips keep their photo
+  let kept = 0;
+  for (let k = state.tips.length - 1; k >= 0; k--) { const t = state.tips[k]; if (t.photo) { if (++kept > MAX_TIP_PHOTOS_KEPT) { t.photo = ''; t.photoDropped = true; } } }
   return ok({ ok: true });
+}
+/** Heart on a spotted deal: add to / remove from this shopper's Favorites. */
+async function routeTipFavorite(c) {
+  const { state, body, now } = c;
+  const consumerId = consumerOf(c);
+  if (!consumerId) return err('Missing shopper id.');
+  const t = state.tips.find((x) => x.id === clean(body.tipId, 40));
+  if (!t || !tipIsLive(t, now)) return err('That spotted deal is no longer available.', 404);
+  state.tipFavs = state.tipFavs || [];
+  const i = state.tipFavs.findIndex((f) => f.tipId === t.id && f.consumerId === consumerId);
+  const want = body.on === undefined ? i < 0 : !!body.on;
+  if (want && i < 0) state.tipFavs.push({ tipId: t.id, consumerId, at: now });
+  if (!want && i >= 0) state.tipFavs.splice(i, 1);
+  return ok({ favorite: want });
 }
 async function routeAdminTips(c) {
   if (!(await authAdmin(c))) return NEED_LOGIN();
@@ -1947,7 +1999,17 @@ async function routeAdminTips(c) {
   let list = state.tips.slice();
   if (q.status) list = list.filter((t) => t.status === q.status);
   if (q.live === '1') list = list.filter((t) => tipIsLive(t, now));
-  return ok({ tips: list.sort((a, z) => z.at - a.at).slice(0, 100).map((t) => ({ ...t, live: tipIsLive(t, now) })) });
+  const all = state.tips;
+  return ok({ tips: list.sort((a, z) => z.at - a.at).slice(0, 100).map((t) => {
+    const d = t.device || {};
+    const same = (f) => (v) => v && all.filter((o) => o.id !== t.id && o.device && o.device[f] === v);
+    const byId = same('id')(d.id) || [], byHash = same('hash')(d.hash) || [], byIp = same('ip')(d.ip) || [];
+    const flags = [];
+    if (byId.length >= 2 || byHash.length >= 2) flags.push(`${Math.max(byId.length, byHash.length) + 1} tips from this device`);
+    if (byIp.length >= 4) flags.push(`${byIp.length + 1} tips from this network`);
+    if ([...byId, ...byHash].some((o) => o.status === 'rejected')) flags.push('same device had a tip rejected');
+    return { ...t, live: tipIsLive(t, now), related: { sameDevice: new Set([...byId, ...byHash].map((o) => o.id)).size, sameNetwork: byIp.length }, flags };
+  }) });
 }
 async function routeAdminTip(c) {
   if (!(await authAdmin(c))) return NEED_LOGIN();
@@ -1970,6 +2032,7 @@ const ROUTES = [
   ['POST', '/api/subscribe', routeSubscribe],
   ['GET', '/api/alerts', routeAlerts],
   ['POST', '/api/tips', routeTip],
+  ['POST', '/api/tips/favorite', routeTipFavorite],
   ['GET', '/api/logo/:id', routeLogo],
   ['POST', '/api/address/verify', routeVerifyAddress],
   ['POST', '/api/business/signup', routeSignup],

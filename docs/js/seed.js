@@ -151,10 +151,13 @@ export async function buildSeed(now) {
     }
   }
 
+  const dev = (n, extra = {}) => ({ id: 'seed-consumer-' + n, hash: 'A1B2C3D4E5F6071' + n, ip: '203.0.113.' + (10 + n), ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) Mobile Safari', screen: '390x844', tz: 'America/New_York', lang: 'en-US', platform: 'iPhone', ...extra });
   s.tips.push(
-    { id: id('t'), consumerId: 'seed-consumer-1', name: 'Hot Pot House', address: '55 Pine Street', note: 'Lunch special: 20% off before 2pm', spotterName: 'Dana', contact: 'dana@example.com', consent: true, status: 'pending', at: now - 1 * DAY, approvedAt: 0 },
-    { id: id('t'), consumerId: 'seed-consumer-2', name: 'Fresh Cuts Barber', address: '4 Market Square', note: 'First haircut free for students on Mondays', spotterName: 'Marcus', contact: '', consent: false, status: 'approved', at: now - 4 * DAY, approvedAt: now - 3 * DAY },
-    { id: id('t'), consumerId: 'seed-consumer-3', name: 'Blue Door Yoga', address: '9 Birch Lane', note: 'Free community class on Sundays', spotterName: 'Priya', contact: '', consent: false, status: 'pending', at: now - 3 * HOUR, approvedAt: 0 },
+    { id: id('t'), consumerId: 'seed-consumer-1', name: 'Hot Pot House', address: '55 Pine Street', note: 'Lunch special: 20% off before 2pm', category: 'food', lat: null, lng: null, photo: '', contact: 'dana@example.com', consent: true, status: 'pending', at: now - 1 * DAY, approvedAt: 0, device: dev(1) },
+    { id: id('t'), consumerId: 'seed-consumer-2', name: 'Fresh Cuts Barber', address: '4 Market Square', note: 'First haircut free for students on Mondays', category: 'beauty', lat: null, lng: null, photo: '', contact: '', consent: false, status: 'approved', at: now - 4 * DAY, approvedAt: now - 3 * DAY, device: dev(2) },
+    { id: id('t'), consumerId: 'seed-consumer-3', name: 'Blue Door Yoga', address: '9 Birch Lane', note: 'Free community class on Sundays', category: 'fitness', lat: null, lng: null, photo: '', contact: '', consent: false, status: 'pending', at: now - 3 * HOUR, approvedAt: 0, device: dev(3) },
+    { id: id('t'), consumerId: 'seed-consumer-2', name: 'Sweet Spot Creamery', address: '12 Harbor Road', note: 'Buy one scoop, get one free after 6pm', category: 'dessert', lat: null, lng: null, photo: '', contact: '', consent: false, status: 'approved', at: now - 1.5 * DAY, approvedAt: now - 1 * DAY, device: dev(2) },
+    { id: id('t'), consumerId: 'seed-consumer-4', name: 'Page Turner Books', address: '88 Elm Street', note: '15% off used books every Saturday', category: 'retail', lat: null, lng: null, photo: '', contact: '', consent: false, status: 'approved', at: now - 9 * DAY, approvedAt: now - 8 * DAY, device: dev(4) },
   );
   s.events.sort((a, z) => a.at - z.at);
   return s;
